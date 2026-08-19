@@ -155,12 +155,100 @@ class CivClient(
 
     // ---- rig control --------------------------------------------------------
 
-    /** Set the operating mode (CI-V mode code) with the rig's default passband. */
+    /** The rig IF filter (FIL1..3) the last mode write carried. */
+    private var lastFil = 1
+
+    /**
+     * Set the operating mode (CI-V mode code), carrying the rig IF filter
+     * selection the last CATCTL_FIL chose (FIL1 on a fresh session).
+     */
     fun setMode(mode: Int): Boolean {
-        val frame = P.writeMode(rigAddr(), mode, 1) ?: return false
+        val frame = P.writeMode(rigAddr(), mode, lastFil) ?: return false
         val ok = transact(frame, P.CMD_WRITE_MODE) != null
         if (ok) modeCode.set(mode)
         return ok
+    }
+
+    /**
+     * One of the rig's own receive controls (CATCTL_* ids). Returns false
+     * for an id this dialect has no wire for — the caller treats that as
+     * "the rig does not have it", never as an error.
+     */
+    fun setControl(id: Int, value: Int): Boolean {
+        val addr = rigAddr()
+        return when (id) {
+            // CATCTL_FIL: the mode write (0x06) carries the IF filter byte.
+            1 -> {
+                if (value !in 1..3) return false
+                lastFil = value
+                val mode = modeCode.get()
+                if (mode >= 0) setMode(mode) else true
+            }
+            // CATCTL_RF_GAIN / CATCTL_SQUELCH / CATCTL_PBT_IN /
+            // CATCTL_PBT_OUT / CATCTL_AF_GAIN: plain 0..255 levels.
+            2, 3, 10, 11, 13 -> {
+                if (value !in 0..255) return false
+                val sub = when (id) {
+                    2 -> P.SUB_LEVEL_RF
+                    3 -> P.SUB_LEVEL_SQL
+                    10 -> P.SUB_LEVEL_PBT_IN
+                    11 -> P.SUB_LEVEL_PBT_OUT
+                    else -> P.SUB_LEVEL_AF
+                }
+                transact(P.setLevel(addr, sub, value), P.CMD_LEVEL) != null
+            }
+            // CATCTL_NR: 0 = off; 1..15 = on, then the strength on the
+            // rig's 0..255 level scale (15 steps of 17).
+            4 -> {
+                if (value !in 0..15) return false
+                val on = value > 0
+                if (transact(
+                        P.setFunc(addr, P.SUB_FUNC_NR, if (on) 1 else 0), P.CMD_FUNC,
+                    ) == null
+                ) {
+                    return false
+                }
+                if (!on) return true
+                val level = value * 255 / 15
+                transact(P.setLevel(addr, P.SUB_LEVEL_NR, level), P.CMD_LEVEL) != null
+            }
+            // CATCTL_NB / CATCTL_NOTCH_AUTO: on/off functions.
+            5, 6 -> {
+                if (value !in 0..1) return false
+                val sub = if (id == 5) P.SUB_FUNC_NB else P.SUB_FUNC_NOTCH_AUTO
+                transact(P.setFunc(addr, sub, value), P.CMD_FUNC) != null
+            }
+            // CATCTL_AGC: 1 fast, 2 mid, 3 slow. These rigs have no AGC-off
+            // code on this command, so 0 is unsupported here.
+            7 -> {
+                if (value !in 1..3) return false
+                transact(P.setFunc(addr, P.SUB_FUNC_AGC, value), P.CMD_FUNC) != null
+            }
+            // CATCTL_PREAMP: 0 off, 1/2 = stage.
+            8 -> {
+                if (value !in 0..2) return false
+                transact(P.setFunc(addr, P.SUB_FUNC_PREAMP, value), P.CMD_FUNC) != null
+            }
+            // CATCTL_ATT: dB as one BCD byte, 0 = off. Accept anything the
+            // wire can carry up to 45 dB; the rig NAKs a step it lacks.
+            9 -> {
+                if (value !in 0..45) return false
+                val frame = P.setAttenuator(addr, value) ?: return false
+                transact(frame, P.CMD_ATTENUATOR) != null
+            }
+            // CATCTL_FILTER_WIDTH: 0x1A 0x03 with the per-mode width code.
+            // 0x1A subcommands are model-family specific — only the known
+            // scope-capable family is proven to put the width there, so an
+            // unknown address gets false rather than a wrong setting.
+            12 -> {
+                if (scopeCaps == null) return false
+                val mode = modeCode.get()
+                if (mode < 0) return false
+                val frame = P.setFilterWidth(addr, mode, value) ?: return false
+                transact(frame, P.CMD_MEM) != null
+            }
+            else -> false
+        }
     }
 
     private fun probeAddr(): Int? {

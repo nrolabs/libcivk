@@ -71,15 +71,40 @@ object CivProtocol {
     const val CMD_READ_MODE = 0x04
     const val CMD_WRITE_FREQ = 0x05
     const val CMD_WRITE_MODE = 0x06
+    const val CMD_ATTENUATOR = 0x11
     const val CMD_LEVEL = 0x14
     const val CMD_READ_METER = 0x15
+    const val CMD_FUNC = 0x16
     const val CMD_READ_ID = 0x19
+    const val CMD_MEM = 0x1A
     const val CMD_PTT = 0x1C
     const val CMD_SCOPE = 0x27
 
     const val SUB_LEVEL_AF = 0x01
     const val SUB_LEVEL_RF = 0x02
+    const val SUB_LEVEL_SQL = 0x03
+    const val SUB_LEVEL_NR = 0x06
+    const val SUB_LEVEL_PBT_IN = 0x07
+    const val SUB_LEVEL_PBT_OUT = 0x08
     const val SUB_LEVEL_RFPOWER = 0x0A
+
+    const val SUB_FUNC_PREAMP = 0x02
+    const val SUB_FUNC_AGC = 0x12
+    const val SUB_FUNC_NB = 0x22
+    const val SUB_FUNC_NR = 0x40
+    const val SUB_FUNC_NOTCH_AUTO = 0x41
+
+    const val SUB_MEM_FILTER_WIDTH = 0x03
+
+    /**
+     * AGC time-constant presets (cmd 0x16 sub 0x12). The current rig line
+     * has no AGC-off code on this command — off is a per-mode time-constant
+     * of 0, a different setting entirely.
+     */
+    const val AGC_FAST = 0x01
+    const val AGC_MID = 0x02
+    const val AGC_SLOW = 0x03
+
     const val SUB_METER_S = 0x02
     const val SUB_METER_POWER = 0x11
     const val SUB_METER_SWR = 0x12
@@ -239,6 +264,74 @@ object CivProtocol {
 
     fun readLevel(to: Int, sub: Int): ByteArray =
         buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_LEVEL.toByte(), sub.toByte()))!!
+
+    /**
+     * Function setting (cmd 0x16): on/off toggles and small enumerations
+     * travel as a single plain data byte, not BCD-scaled levels.
+     */
+    fun setFunc(to: Int, sub: Int, data: Int): ByteArray =
+        buildFrame(
+            to, CONTROLLER_ADDR,
+            byteArrayOf(CMD_FUNC.toByte(), sub.toByte(), data.toByte()),
+        )!!
+
+    /**
+     * Attenuator (cmd 0x11): the dB amount itself is the single data byte,
+     * packed as two BCD digits (12 dB = 0x12); 0 switches the attenuator
+     * off. Null beyond the two-digit field.
+     */
+    fun setAttenuator(to: Int, db: Int): ByteArray? {
+        if (db !in 0..99) return null
+        val bcd = ((db / 10) shl 4) or (db % 10)
+        return buildFrame(
+            to, CONTROLLER_ADDR,
+            byteArrayOf(CMD_ATTENUATOR.toByte(), bcd.toByte()),
+        )
+    }
+
+    /**
+     * Width-code table index for [hz] in the given operating mode, snapped
+     * to the nearest code the rig accepts.
+     *
+     * SSB/CW/RTTY share one table: codes 0..9 are 50..500 Hz in 50 Hz
+     * steps, 10..40 are 600..3600 Hz in 100 Hz steps. AM has its own:
+     * codes 0..49 are 200..10000 Hz in 200 Hz steps. FM (and anything
+     * else) has no width command — null.
+     */
+    fun widthCodeForMode(mode: Int, hz: Int): Int? {
+        val codeToHz: (Int) -> Int
+        val maxCode: Int
+        when (mode) {
+            MODE_LSB, MODE_USB, MODE_CW, MODE_CW_R, MODE_RTTY, MODE_RTTY_R -> {
+                codeToHz = { c -> if (c <= 9) 50 * (c + 1) else 600 + 100 * (c - 10) }
+                maxCode = 40
+            }
+            MODE_AM -> {
+                codeToHz = { c -> 200 * (c + 1) }
+                maxCode = 49
+            }
+            else -> return null
+        }
+        return (0..maxCode).minByOrNull { kotlin.math.abs(codeToHz(it) - hz) }
+    }
+
+    /**
+     * IF filter width (cmd 0x1A sub 0x03). The data byte is the width CODE
+     * from the per-mode table, itself packed as two BCD digits (code 40 =
+     * 0x40). Null when the mode has no width command.
+     *
+     * 0x1A subcommands are model-family specific — on other families this
+     * address means something unrelated — so the caller gates this on a rig
+     * known to speak it.
+     */
+    fun setFilterWidth(to: Int, mode: Int, hz: Int): ByteArray? {
+        val code = widthCodeForMode(mode, hz) ?: return null
+        val bcd = ((code / 10) shl 4) or (code % 10)
+        return buildFrame(
+            to, CONTROLLER_ADDR,
+            byteArrayOf(CMD_MEM.toByte(), SUB_MEM_FILTER_WIDTH.toByte(), bcd.toByte()),
+        )
+    }
 
     fun readMeter(to: Int, sub: Int): ByteArray =
         buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_READ_METER.toByte(), sub.toByte()))!!
