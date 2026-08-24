@@ -19,6 +19,7 @@
 package com.isaklab.libcivk
 
 import com.isaklab.isdrdrivers.core.RadioClient
+import com.isaklab.isdrdrivers.core.CatControlCapable
 import com.isaklab.isdrdrivers.core.TransmitCapable
 import com.isaklab.libcivk.CivProtocol as P
 import java.util.concurrent.ArrayBlockingQueue
@@ -47,7 +48,7 @@ class CivClient(
     /** (power spectrum in dB, interleaved IQ — always empty for CI-V) */
     private val onDataReceived: (FloatArray, FloatArray) -> Unit,
     private val onConnectionStatusChanged: (Boolean, String) -> Unit,
-) : RadioClient, TransmitCapable {
+) : RadioClient, TransmitCapable, CatControlCapable {
 
     companion object {
         /** How long one request waits for its reply before retrying, in ms. */
@@ -250,6 +251,12 @@ class CivClient(
             else -> false
         }
     }
+
+    override fun setCatMode(mode: Int): Boolean = setMode(mode)
+
+    override fun currentCatMode(): Int = mode()
+
+    override fun setCatControl(id: Int, value: Int): Boolean = setControl(id, value)
 
     private fun probeAddr(): Int? {
         for (addr in PROBE_ADDRS) {
@@ -466,9 +473,11 @@ class CivClient(
 
     // ---- TransmitCapable ---------------------------------------------------------
 
-    override fun setTxFrequency(hz: Long) {
-        // The rig transmits where it is tuned; there is no separate TX NCO.
-        setFrequency(hz)
+    override fun setTxFrequency(hz: Long): Boolean {
+        // A plain CI-V frequency write targets the active receive VFO. Until
+        // this dialect has model-gated split/duplex commands plus read-back,
+        // claiming a TX-frequency write would silently move reception.
+        return false
     }
 
     override fun setPtt(on: Boolean) {
