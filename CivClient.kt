@@ -24,6 +24,7 @@ import com.isaklab.isdrdrivers.core.RadioClient
 import com.isaklab.isdrdrivers.core.TransmitCapable
 import com.isaklab.isdrproto.CatRepeater
 import com.isaklab.isdrproto.CatRepeaterConfig
+import com.isaklab.isdrproto.DriverProto
 import com.isaklab.libcivk.CivProtocol as P
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
@@ -289,12 +290,34 @@ class CivClient(
      * Set the operating mode (CI-V mode code), carrying the rig IF filter
      * selection the last CATCTL_FIL chose (FIL1 on a fresh session).
      */
-    fun setMode(mode: Int): Boolean {
+    fun setMode(mode: Int): Boolean = setModeWithFilter(mode, lastFil)
+
+    private fun setModeWithFilter(mode: Int, filter: Int): Boolean {
         if (repeaterInFlight.get()) return false
-        val frame = P.writeMode(rigAddr(), mode, lastFil) ?: return false
-        val ok = transact(frame, P.CMD_WRITE_MODE) != null
-        if (ok) modeCode.set(mode)
-        return ok
+        val knownBits = 0xFF or DriverProto.CAT_MODE_DATA_FLAG
+        if (mode and knownBits.inv() != 0) return false
+        val base = mode and 0xFF
+        val data = mode and DriverProto.CAT_MODE_DATA_FLAG != 0
+        val addr = rigAddr()
+        val modeData = data || CivModels.supportsModeData(addr)
+        val frame = if (modeData) {
+            P.writeModeData(addr, base, data, filter)
+        } else {
+            P.writeMode(addr, base, filter)
+        } ?: return false
+        val command = if (modeData) P.CMD_MODE_DATA else P.CMD_WRITE_MODE
+        if (transact(frame, command) == null) return false
+
+        val actual = if (modeData) {
+            transact(P.readModeData(addr), P.CMD_MODE_DATA)?.let(P::parseModeData)
+        } else {
+            transact(P.readMode(addr), P.CMD_READ_MODE)?.let(P::parseMode)
+        } ?: return false
+        lastFil = actual.filter
+        val actualCode = actual.mode or
+            (if (actual.data) DriverProto.CAT_MODE_DATA_FLAG else 0)
+        modeCode.set(actualCode)
+        return actualCode == mode
     }
 
     /**
@@ -309,9 +332,8 @@ class CivClient(
             // CATCTL_FIL: the mode write (0x06) carries the IF filter byte.
             1 -> {
                 if (value !in 1..3) return false
-                lastFil = value
                 val mode = modeCode.get()
-                if (mode >= 0) setMode(mode) else true
+                if (mode >= 0) setModeWithFilter(mode, value) else false
             }
             // CATCTL_RF_GAIN / CATCTL_SQUELCH / CATCTL_PBT_IN /
             // CATCTL_PBT_OUT / CATCTL_AF_GAIN: plain 0..255 levels.
@@ -1023,12 +1045,19 @@ class CivClient(
     private fun readInitialState() {
         val addr = rigAddr()
         transact(P.readFrequency(addr), P.CMD_READ_FREQ)?.let { data ->
-            if (data.size >= 5) {
-                P.fromBcdLe(data.copyOfRange(0, 5))?.let { freqHz.set(it) }
-            }
+            P.parseFrequency(data)?.let { freqHz.set(it) }
         }
-        transact(P.readMode(addr), P.CMD_READ_MODE)?.let { data ->
-            if (data.isNotEmpty()) modeCode.set(data[0].toInt() and 0xFF)
+        val mode = if (CivModels.supportsModeData(addr)) {
+            transact(P.readModeData(addr), P.CMD_MODE_DATA)?.let(P::parseModeData)
+        } else {
+            transact(P.readMode(addr), P.CMD_READ_MODE)?.let(P::parseMode)
+        }
+        mode?.let { actual ->
+            lastFil = actual.filter
+            modeCode.set(
+                actual.mode or
+                    (if (actual.data) DriverProto.CAT_MODE_DATA_FLAG else 0),
+            )
         }
     }
 
@@ -1098,9 +1127,7 @@ class CivClient(
                 val data = frame.data
                 when {
                     frame.cmd == P.CMD_TRANSCEIVE_FREQ -> {
-                        if (data.size >= 5) {
-                            P.fromBcdLe(data.copyOfRange(0, 5))?.let { freqHz.set(it) }
-                        }
+                        P.parseFrequency(data)?.let { freqHz.set(it) }
                         return
                     }
                     frame.cmd == P.CMD_TRANSCEIVE_MODE -> {
@@ -1237,12 +1264,7 @@ class CivClient(
             "reading physical CI-V frequency",
             false,
         ).getOrElse { throw IllegalStateException(it.message ?: "frequency read-back failed") }
-        if (data.size != 5) {
-            throw IllegalStateException(
-                "malformed CI-V frequency read-back ${wireBytes(data)}",
-            )
-        }
-        val actual = P.fromBcdLe(data)
+        val actual = P.parseFrequency(data)
             ?: throw IllegalStateException("non-BCD CI-V frequency read-back ${wireBytes(data)}")
         freqHz.set(actual)
         if (actual != hz) {

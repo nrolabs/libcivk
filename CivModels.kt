@@ -94,6 +94,11 @@ object CivModels {
         else -> null
     }
 
+    /** Models whose selected-VFO 0x26 command proves the DATA flag. */
+    fun supportsModeData(addr: Int): Boolean = addr == ADDR_IC7300 ||
+        addr == ADDR_IC7610 || addr == ADDR_IC9700 || addr == ADDR_IC705 ||
+        addr == ADDR_IC905
+
     /**
      * Repeater capability is address-specific. Generic CI-V syntax is not
      * evidence that an unknown radio implements any of these registers.

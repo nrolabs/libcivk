@@ -82,6 +82,7 @@ object CivProtocol {
     const val CMD_MEM = 0x1A
     const val CMD_TONE = 0x1B
     const val CMD_PTT = 0x1C
+    const val CMD_MODE_DATA = 0x26
     const val CMD_SCOPE = 0x27
 
     const val SUB_LEVEL_AF = 0x01
@@ -123,6 +124,7 @@ object CivProtocol {
     const val SUB_METER_ALC = 0x13
     const val SUB_PTT = 0x00
     const val SUB_ID = 0x00
+    const val SUB_MODE_DATA_SELECTED = 0x00
 
     const val SUB_SCOPE_WAVE = 0x00
     const val SUB_SCOPE_ON = 0x10
@@ -143,8 +145,8 @@ object CivProtocol {
     const val MODE_CW_R = 0x07
     const val MODE_RTTY_R = 0x08
 
-    /** Highest frequency expressible in the 10-digit BCD field. */
-    const val MAX_FREQ_HZ = 9_999_999_999L
+    /** Highest frequency expressible in the 12-digit CI-V BCD field. */
+    const val MAX_FREQ_HZ = 99_999_999_999L
 
     const val SCOPE_MODE_CENTER = 0x00
     const val SCOPE_MODE_FIXED = 0x01
@@ -184,6 +186,13 @@ object CivProtocol {
             v = v * 100 + hi * 10 + lo
         }
         return v
+    }
+
+    /** Decode an exact 5-byte normal-band or 6-byte IC-905 frequency. */
+    fun parseFrequency(bytes: ByteArray): Long? {
+        if (bytes.size != 5 && bytes.size != 6) return null
+        val hz = fromBcdLe(bytes) ?: return null
+        return hz.takeIf { it <= MAX_FREQ_HZ }
     }
 
     /** Decode packed big-endian BCD (levels, meters, scope division counters). */
@@ -249,23 +258,67 @@ object CivProtocol {
     fun readFrequency(to: Int): ByteArray =
         buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_READ_FREQ.toByte()))!!
 
-    /** Null when [hz] is negative or beyond the 10-digit field. */
+    /** Null beyond 12 digits; the sixth byte is used only above 9.999 GHz. */
     fun writeFrequency(to: Int, hz: Long): ByteArray? {
         if (hz !in 0..MAX_FREQ_HZ) return null
-        val bcd = toBcdLe(hz, 5) ?: return null
+        val bcd = toBcdLe(hz, if (hz <= 9_999_999_999L) 5 else 6) ?: return null
         return buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_WRITE_FREQ.toByte()) + bcd)
     }
 
     fun readMode(to: Int): ByteArray =
         buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_READ_MODE.toByte()))!!
 
+    data class ModeState(val mode: Int, val data: Boolean, val filter: Int)
+
+    /** Read the selected VFO mode, DATA flag and IF filter. */
+    fun readModeData(to: Int): ByteArray = buildFrame(
+        to,
+        CONTROLLER_ADDR,
+        byteArrayOf(CMD_MODE_DATA.toByte(), SUB_MODE_DATA_SELECTED.toByte()),
+    )!!
+
     /** [filter] is the rig's passband selection 1..3. */
     fun writeMode(to: Int, mode: Int, filter: Int): ByteArray? {
-        if (filter !in 1..3) return null
+        if (mode !in 0..0x23 || filter !in 1..3) return null
         return buildFrame(
             to, CONTROLLER_ADDR,
             byteArrayOf(CMD_WRITE_MODE.toByte(), mode.toByte(), filter.toByte()),
         )
+    }
+
+    /** Selected-VFO mode with the explicit DATA flag (0x26 sub 0x00). */
+    fun writeModeData(to: Int, mode: Int, data: Boolean, filter: Int): ByteArray? {
+        if (mode !in 0..0x23 || filter !in 1..3) return null
+        return buildFrame(
+            to,
+            CONTROLLER_ADDR,
+            byteArrayOf(
+                CMD_MODE_DATA.toByte(),
+                SUB_MODE_DATA_SELECTED.toByte(),
+                mode.toByte(),
+                if (data) 1 else 0,
+                filter.toByte(),
+            ),
+        )
+    }
+
+    fun parseMode(data: ByteArray): ModeState? {
+        if (data.size != 2) return null
+        val mode = data[0].toInt() and 0xFF
+        val filter = data[1].toInt() and 0xFF
+        if (mode > 0x23 || filter !in 1..3) return null
+        return ModeState(mode, false, filter)
+    }
+
+    fun parseModeData(data: ByteArray): ModeState? {
+        if (data.size != 4 ||
+            (data[0].toInt() and 0xFF) != SUB_MODE_DATA_SELECTED
+        ) return null
+        val mode = data[1].toInt() and 0xFF
+        val dataFlag = data[2].toInt() and 0xFF
+        val filter = data[3].toInt() and 0xFF
+        if (mode > 0x23 || dataFlag !in 0..1 || filter !in 1..3) return null
+        return ModeState(mode, dataFlag == 1, filter)
     }
 
     fun setPtt(to: Int, on: Boolean): ByteArray =
