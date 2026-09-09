@@ -53,6 +53,8 @@ class CivClient(
     /** (power spectrum in dB, interleaved IQ — always empty for CI-V) */
     private val onDataReceived: (FloatArray, FloatArray) -> Unit,
     private val onConnectionStatusChanged: (Boolean, String) -> Unit,
+    /** Expected value reported by CI-V 0x19/0x00, or null for generic discovery. */
+    private val requiredReportedCivAddress: Int? = null,
 ) : RadioClient, TransmitCapable, CatControlCapable, CatRepeaterCapable {
 
     companion object {
@@ -98,6 +100,12 @@ class CivClient(
 
     private val configuredAddr = configuredAddr and 0xFF
     private var transport: CivTransport? = transport
+
+    init {
+        require(requiredReportedCivAddress == null || requiredReportedCivAddress in 1..0xFF) {
+            "required reported CI-V address must be between 0x01 and 0xFF"
+        }
+    }
 
     private val freqHz = AtomicLong(0)
     private val spanHz = AtomicLong(0)
@@ -1216,13 +1224,52 @@ class CivClient(
         rigAddrAtomic.set(addr)
 
         // A configured address still has to answer before this counts as
-        // connected; a silent port is a failure, not a session.
-        if (configuredAddr != 0 &&
-            transact(P.readTransceiverId(addr), P.CMD_READ_ID) == null
-        ) {
+        // connected; a silent port is a failure, not a session. Keep the
+        // reply so an exact profile can validate what 0x19/0x00 reported.
+        val configuredIdReply = if (configuredAddr != 0) {
+            transact(P.readTransceiverId(addr), P.CMD_READ_ID)
+        } else {
+            null
+        }
+        if (configuredAddr != 0 && configuredIdReply == null) {
             disconnect()
-            onConnectionStatusChanged(false, "rig did not answer")
+            val detail = if (requiredReportedCivAddress == null) {
+                "rig did not answer"
+            } else {
+                "CI-V address 0x%02X did not answer the transceiver-address query"
+                    .format(requiredReportedCivAddress)
+            }
+            onConnectionStatusChanged(false, detail)
             return false
+        }
+
+        requiredReportedCivAddress?.let { required ->
+            // Probe mode consumed its discovery reply already, so ask once
+            // more and validate the correlated response strictly. A CI-V
+            // address is configurable and must not be described as immutable
+            // product identity.
+            val reply = configuredIdReply
+                ?: transact(P.readTransceiverId(addr), P.CMD_READ_ID)
+            val reported = reply?.takeIf {
+                it.size == 2 && (it[0].toInt() and 0xFF) == P.SUB_ID
+            }?.get(1)?.toInt()?.and(0xFF)
+            if (reported == null) {
+                disconnect()
+                onConnectionStatusChanged(
+                    false,
+                    "malformed CI-V transceiver-address response; expected 0x19/0x00 plus one address byte",
+                )
+                return false
+            }
+            if (reported != required) {
+                disconnect()
+                onConnectionStatusChanged(
+                    false,
+                    "CI-V address mismatch: expected reported address 0x%02X, radio reported 0x%02X"
+                        .format(required, reported),
+                )
+                return false
+            }
         }
 
         scopeCaps = CivModels.scopeCaps(addr)
