@@ -290,9 +290,9 @@ class CivClient(
      * Set the operating mode (CI-V mode code), carrying the rig IF filter
      * selection the last CATCTL_FIL chose (FIL1 on a fresh session).
      */
-    fun setMode(mode: Int): Boolean = setModeWithFilter(mode, lastFil)
+    fun setMode(mode: Int): Boolean = setModeWithFilter(mode, lastFil, requireFilter = false)
 
-    private fun setModeWithFilter(mode: Int, filter: Int): Boolean {
+    private fun setModeWithFilter(mode: Int, filter: Int, requireFilter: Boolean): Boolean {
         if (repeaterInFlight.get()) return false
         val knownBits = 0xFF or DriverProto.CAT_MODE_DATA_FLAG
         if (mode and knownBits.inv() != 0) return false
@@ -313,11 +313,11 @@ class CivClient(
         } else {
             transact(P.readMode(addr), P.CMD_READ_MODE)?.let(P::parseMode)
         } ?: return false
-        lastFil = actual.filter
+        actual.filter?.let { lastFil = it }
         val actualCode = actual.mode or
             (if (actual.data) DriverProto.CAT_MODE_DATA_FLAG else 0)
         modeCode.set(actualCode)
-        return actualCode == mode
+        return actualCode == mode && (!requireFilter || actual.filter == filter)
     }
 
     /**
@@ -333,7 +333,7 @@ class CivClient(
             1 -> {
                 if (value !in 1..3) return false
                 val mode = modeCode.get()
-                if (mode >= 0) setModeWithFilter(mode, value) else false
+                if (mode >= 0) setModeWithFilter(mode, value, requireFilter = true) else false
             }
             // CATCTL_RF_GAIN / CATCTL_SQUELCH / CATCTL_PBT_IN /
             // CATCTL_PBT_OUT / CATCTL_AF_GAIN: plain 0..255 levels.
@@ -1053,7 +1053,7 @@ class CivClient(
             transact(P.readMode(addr), P.CMD_READ_MODE)?.let(P::parseMode)
         }
         mode?.let { actual ->
-            lastFil = actual.filter
+            actual.filter?.let { lastFil = it }
             modeCode.set(
                 actual.mode or
                     (if (actual.data) DriverProto.CAT_MODE_DATA_FLAG else 0),

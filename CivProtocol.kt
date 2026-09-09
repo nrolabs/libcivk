@@ -268,7 +268,12 @@ object CivProtocol {
     fun readMode(to: Int): ByteArray =
         buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_READ_MODE.toByte()))!!
 
-    data class ModeState(val mode: Int, val data: Boolean, val filter: Int)
+    /**
+     * Physical mode state. [filter] is null when a legacy 0x04 reply omits the
+     * optional filter byte; callers must not turn that absence into a FIL
+     * confirmation.
+     */
+    data class ModeState(val mode: Int, val data: Boolean, val filter: Int?)
 
     /** Read the selected VFO mode, DATA flag and IF filter. */
     fun readModeData(to: Int): ByteArray = buildFrame(
@@ -303,10 +308,10 @@ object CivProtocol {
     }
 
     fun parseMode(data: ByteArray): ModeState? {
-        if (data.size != 2) return null
+        if (data.size !in 1..2) return null
         val mode = data[0].toInt() and 0xFF
-        val filter = data[1].toInt() and 0xFF
-        if (mode > 0x23 || filter !in 1..3) return null
+        val filter = data.getOrNull(1)?.toInt()?.and(0xFF)
+        if (mode > 0x23 || filter != null && filter !in 1..3) return null
         return ModeState(mode, false, filter)
     }
 
