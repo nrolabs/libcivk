@@ -18,6 +18,8 @@
  */
 package com.isaklab.libcivk
 
+import com.isaklab.isdrproto.CatRepeater
+
 /**
  * What each CI-V address is known to be, and what its scope produces.
  *
@@ -49,6 +51,15 @@ object CivModels {
         }
     }
 
+    /** Exact model facts needed before an RF-affecting repeater command is legal. */
+    data class RigCaps(
+        val hasTx: Boolean,
+        val repeaterCaps: Int,
+        val repeaterOffsetBytes: Int,
+        val repeaterOffsetStepHz: Long,
+        val extendedCtcss: Boolean,
+    )
+
     /** Default bus addresses of the scope-capable rigs. */
     const val ADDR_IC7300 = 0x94
     const val ADDR_IC7610 = 0x98
@@ -64,6 +75,43 @@ object CivModels {
         ADDR_IC7851,
         -> ScopeCaps.standard()
         else -> null
+    }
+
+    /**
+     * Repeater capability is address-specific. Generic CI-V syntax is not
+     * evidence that an unknown radio implements any of these registers.
+     */
+    fun rigCaps(addr: Int): RigCaps {
+        val ctcss = CatRepeater.CAP_CTCSS_TX or CatRepeater.CAP_CTCSS_RX
+        val full = CatRepeater.CAP_DUPLEX or CatRepeater.CAP_OFFSET or ctcss or
+            CatRepeater.CAP_DCS_TX or CatRepeater.CAP_DCS_RX or
+            CatRepeater.CAP_DCS_POLARITY or CatRepeater.CAP_CROSS_TONE
+        return when (addr) {
+            ADDR_IC7300 -> RigCaps(true, ctcss, 0, 0, true)
+            ADDR_IC705 -> RigCaps(true, full, 3, 100, true)
+            ADDR_IC7610 -> RigCaps(true, ctcss, 0, 0, false)
+            ADDR_IC9700 -> RigCaps(true, full, 3, 100, true)
+            ADDR_IC905 -> RigCaps(true, full, 3, 100, true)
+            ADDR_IC7851 -> RigCaps(true, ctcss, 0, 0, false)
+            ADDR_ICR8600 -> RigCaps(
+                hasTx = false,
+                repeaterCaps = CatRepeater.CAP_DUPLEX or CatRepeater.CAP_OFFSET or
+                    CatRepeater.CAP_CTCSS_RX or CatRepeater.CAP_DCS_RX or
+                    CatRepeater.CAP_DCS_POLARITY,
+                repeaterOffsetBytes = 4,
+                repeaterOffsetStepHz = 1_000,
+                extendedCtcss = false,
+            )
+            else -> RigCaps(true, 0, 0, 0, false)
+        }
+    }
+
+    /** Native offset maximum at the current receive frequency. */
+    fun repeaterMaxOffsetHz(addr: Int, rxHz: Long): Long = when (addr) {
+        ADDR_IC705 -> 9_999_900
+        ADDR_IC9700, ADDR_IC905 -> if (rxHz >= 1_200_000_000L) 99_999_900 else 9_999_900
+        ADDR_ICR8600 -> 299_999_000
+        else -> 0
     }
 
     /** Human name for a bus address, when the default assignment is known. */

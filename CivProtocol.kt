@@ -71,12 +71,16 @@ object CivProtocol {
     const val CMD_READ_MODE = 0x04
     const val CMD_WRITE_FREQ = 0x05
     const val CMD_WRITE_MODE = 0x06
+    const val CMD_READ_REPEATER_OFFSET = 0x0C
+    const val CMD_SET_REPEATER_OFFSET = 0x0D
+    const val CMD_DUPLEX = 0x0F
     const val CMD_ATTENUATOR = 0x11
     const val CMD_LEVEL = 0x14
     const val CMD_READ_METER = 0x15
     const val CMD_FUNC = 0x16
     const val CMD_READ_ID = 0x19
     const val CMD_MEM = 0x1A
+    const val CMD_TONE = 0x1B
     const val CMD_PTT = 0x1C
     const val CMD_SCOPE = 0x27
 
@@ -93,6 +97,14 @@ object CivProtocol {
     const val SUB_FUNC_NB = 0x22
     const val SUB_FUNC_NR = 0x40
     const val SUB_FUNC_NOTCH_AUTO = 0x41
+    const val SUB_FUNC_REPEATER_TONE = 0x42
+    const val SUB_FUNC_TONE_SQUELCH = 0x43
+    const val SUB_FUNC_DCS = 0x4B
+    const val SUB_FUNC_TONE_MODE = 0x5D
+
+    const val SUB_TONE_TX = 0x00
+    const val SUB_TONE_RX = 0x01
+    const val SUB_TONE_DCS = 0x02
 
     const val SUB_MEM_FILTER_WIDTH = 0x03
 
@@ -187,6 +199,21 @@ object CivProtocol {
         return v
     }
 
+    /** Pack [value] as packed big-endian BCD, two digits per byte. */
+    fun toBcdBe(value: Long, len: Int): ByteArray? {
+        if (value < 0) return null
+        var v = value
+        val out = ByteArray(len)
+        for (i in out.indices.reversed()) {
+            val lo = (v % 10).toInt()
+            v /= 10
+            val hi = (v % 10).toInt()
+            v /= 10
+            out[i] = ((hi shl 4) or lo).toByte()
+        }
+        return out.takeIf { v == 0L }
+    }
+
     /** Pack [value] (0..9999) as 2-byte big-endian BCD — the level format. */
     fun toBcdBe2(value: Int): ByteArray? {
         if (value !in 0..9999) return null
@@ -253,6 +280,89 @@ object CivProtocol {
     fun readTransceiverId(to: Int): ByteArray =
         buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_READ_ID.toByte(), SUB_ID.toByte()))!!
 
+    /** Set simplex, duplex-minus, or duplex-plus (`0x0F 10/11/12`). */
+    fun setDuplex(to: Int, duplex: Int): ByteArray? {
+        val code = when (duplex) {
+            com.isaklab.isdrproto.CatRepeater.DUPLEX_SIMPLEX -> 0x10
+            com.isaklab.isdrproto.CatRepeater.DUPLEX_MINUS -> 0x11
+            com.isaklab.isdrproto.CatRepeater.DUPLEX_PLUS -> 0x12
+            else -> return null
+        }
+        return buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_DUPLEX.toByte(), code.toByte()))
+    }
+
+    fun readDuplex(to: Int): ByteArray =
+        buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_DUPLEX.toByte()))!!
+
+    fun parseDuplex(data: ByteArray): Int? = when {
+        data.contentEquals(byteArrayOf(0x10)) -> com.isaklab.isdrproto.CatRepeater.DUPLEX_SIMPLEX
+        data.contentEquals(byteArrayOf(0x11)) -> com.isaklab.isdrproto.CatRepeater.DUPLEX_MINUS
+        data.contentEquals(byteArrayOf(0x12)) -> com.isaklab.isdrproto.CatRepeater.DUPLEX_PLUS
+        else -> null
+    }
+
+    /** CI-V offsets are unsigned little-endian BCD in 100 Hz units. */
+    fun setRepeaterOffset(to: Int, offsetHz: Long, bytes: Int): ByteArray? {
+        if (offsetHz < 0 || offsetHz % 100L != 0L || bytes !in 3..4) return null
+        val bcd = toBcdLe(offsetHz / 100L, bytes) ?: return null
+        return buildFrame(
+            to,
+            CONTROLLER_ADDR,
+            byteArrayOf(CMD_SET_REPEATER_OFFSET.toByte()) + bcd,
+        )
+    }
+
+    fun readRepeaterOffset(to: Int): ByteArray =
+        buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_READ_REPEATER_OFFSET.toByte()))!!
+
+    fun parseRepeaterOffset(data: ByteArray, bytes: Int): Long? {
+        if (data.size != bytes || bytes !in 3..4) return null
+        return fromBcdLe(data)?.let { runCatching { Math.multiplyExact(it, 100L) }.getOrNull() }
+    }
+
+    /** Repeater/TSQL tone frequency, three-byte big-endian BCD in tenths Hz. */
+    fun setCtcssTone(to: Int, sub: Int, tenthsHz: Int): ByteArray? {
+        if (sub != SUB_TONE_TX && sub != SUB_TONE_RX || tenthsHz < 0) return null
+        val bcd = toBcdBe(tenthsHz.toLong(), 3) ?: return null
+        return buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_TONE.toByte(), sub.toByte()) + bcd)
+    }
+
+    fun readTone(to: Int, sub: Int): ByteArray? {
+        if (sub != SUB_TONE_TX && sub != SUB_TONE_RX && sub != SUB_TONE_DCS) return null
+        return buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_TONE.toByte(), sub.toByte()))
+    }
+
+    fun parseCtcssTone(data: ByteArray, sub: Int): Int? {
+        if (data.size != 4 || (data[0].toInt() and 0xFF) != sub ||
+            sub != SUB_TONE_TX && sub != SUB_TONE_RX
+        ) return null
+        return fromBcdBe(data.copyOfRange(1, data.size))?.toInt()
+    }
+
+    /** DCS code plus independent TX/RX polarity. */
+    fun setDcs(to: Int, code: Int, txPolarity: Int, rxPolarity: Int): ByteArray? {
+        if (code < 0 || txPolarity !in 0..1 || rxPolarity !in 0..1) return null
+        val bcd = toBcdBe2(code) ?: return null
+        return buildFrame(
+            to,
+            CONTROLLER_ADDR,
+            byteArrayOf(
+                CMD_TONE.toByte(), SUB_TONE_DCS.toByte(),
+                ((txPolarity shl 4) or rxPolarity).toByte(), bcd[0], bcd[1],
+            ),
+        )
+    }
+
+    fun parseDcs(data: ByteArray): Triple<Int, Int, Int>? {
+        if (data.size != 4 || (data[0].toInt() and 0xFF) != SUB_TONE_DCS) return null
+        val polarity = data[1].toInt() and 0xFF
+        val tx = polarity shr 4
+        val rx = polarity and 0x0F
+        if (tx !in 0..1 || rx !in 0..1) return null
+        val code = fromBcdBe(data.copyOfRange(2, data.size))?.toInt() ?: return null
+        return Triple(code, tx, rx)
+    }
+
     /** [value] on the rig's 0..255 scale, sent as 4-digit big-endian BCD. */
     fun setLevel(to: Int, sub: Int, value: Int): ByteArray {
         val bcd = toBcdBe2(value and 0xFF)!!
@@ -274,6 +384,9 @@ object CivProtocol {
             to, CONTROLLER_ADDR,
             byteArrayOf(CMD_FUNC.toByte(), sub.toByte(), data.toByte()),
         )!!
+
+    fun readFunc(to: Int, sub: Int): ByteArray =
+        buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_FUNC.toByte(), sub.toByte()))!!
 
     /**
      * Attenuator (cmd 0x11): the dB amount itself is the single data byte,
