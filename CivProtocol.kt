@@ -375,6 +375,13 @@ object CivProtocol {
     fun readLevel(to: Int, sub: Int): ByteArray =
         buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_LEVEL.toByte(), sub.toByte()))!!
 
+    /** Parse one exact level read-back: subcommand plus 0000..0255 BCD. */
+    fun parseLevel(data: ByteArray, sub: Int): Int? {
+        if (data.size != 3 || (data[0].toInt() and 0xFF) != sub) return null
+        val value = fromBcdBe(data.copyOfRange(1, data.size)) ?: return null
+        return value.toInt().takeIf { value in 0L..255L }
+    }
+
     /**
      * Function setting (cmd 0x16): on/off toggles and small enumerations
      * travel as a single plain data byte, not BCD-scaled levels.

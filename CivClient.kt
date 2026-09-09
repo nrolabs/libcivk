@@ -384,6 +384,17 @@ class CivClient(
                 val frame = P.setFilterWidth(addr, mode, value) ?: return false
                 transact(frame, P.CMD_MEM) != null
             }
+            // CATCTL_RF_POWER: setting an RF-affecting value is successful
+            // only after an independent read returns the exact 0..255 level.
+            14 -> {
+                if (value !in 0..255 || !CivModels.rigCaps(addr).hasTx) return false
+                if (transact(P.setLevel(addr, P.SUB_LEVEL_RFPOWER, value), P.CMD_LEVEL) == null) {
+                    return false
+                }
+                val actual = transact(P.readLevel(addr, P.SUB_LEVEL_RFPOWER), P.CMD_LEVEL)
+                    ?.let { P.parseLevel(it, P.SUB_LEVEL_RFPOWER) }
+                actual == value
+            }
             else -> false
         }
     }
