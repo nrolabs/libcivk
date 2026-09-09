@@ -30,6 +30,15 @@ import com.isaklab.isdrproto.CatRepeater
  */
 object CivModels {
 
+    val COMMON_SCOPE_SPANS_HZ = listOf(
+        2_500L, 5_000L, 10_000L, 25_000L, 50_000L, 100_000L, 250_000L, 500_000L,
+    )
+
+    val R8600_SCOPE_SPANS_HZ = COMMON_SCOPE_SPANS_HZ + listOf(1_000_000L, 2_500_000L)
+
+    val IC905_SCOPE_SPANS_HZ = COMMON_SCOPE_SPANS_HZ +
+        listOf(1_000_000L, 2_500_000L, 5_000_000L, 10_000_000L, 25_000_000L)
+
     /** Geometry and level scale of a rig's scope waveform. */
     data class ScopeCaps(
         /** Amplitude bins in one complete sweep. */
@@ -40,6 +49,8 @@ object CivModels {
         val dbMin: Float,
         /** Top of the scale on the display, in dB. */
         val dbMax: Float,
+        /** Exact centre-mode spans the identified model accepts. */
+        val spansHz: List<Long>,
     ) {
         companion object {
             /**
@@ -47,7 +58,13 @@ object CivModels {
              * rig to date: 475 bins, amplitude 0..160 spanning an 80 dB
              * window.
              */
-            fun standard() = ScopeCaps(lineLength = 475, levelMax = 160, dbMin = -80f, dbMax = 0f)
+            fun standard(spansHz: List<Long> = COMMON_SCOPE_SPANS_HZ) = ScopeCaps(
+                lineLength = 475,
+                levelMax = 160,
+                dbMin = -80f,
+                dbMax = 0f,
+                spansHz = spansHz,
+            )
         }
     }
 
@@ -71,9 +88,9 @@ object CivModels {
 
     /** Scope geometry for a bus address; null for control-only rigs. */
     fun scopeCaps(addr: Int): ScopeCaps? = when (addr) {
-        ADDR_IC7300, ADDR_IC7610, ADDR_IC9700, ADDR_IC705, ADDR_IC905, ADDR_ICR8600,
-        ADDR_IC7851,
-        -> ScopeCaps.standard()
+        ADDR_IC7300, ADDR_IC7610, ADDR_IC9700, ADDR_IC705 -> ScopeCaps.standard()
+        ADDR_IC905 -> ScopeCaps.standard(IC905_SCOPE_SPANS_HZ)
+        ADDR_ICR8600 -> ScopeCaps.standard(R8600_SCOPE_SPANS_HZ)
         else -> null
     }
 

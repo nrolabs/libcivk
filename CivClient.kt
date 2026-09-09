@@ -72,14 +72,6 @@ class CivClient(
 
         private val EMPTY_FLOATS = FloatArray(0)
 
-        /**
-         * Spans the centre-mode scope accepts, in Hz. Requests snap to the
-         * nearest; the rig's read-back remains the truth.
-         */
-        val SCOPE_SPANS = longArrayOf(
-            5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000,
-        )
-
         /** Bus addresses tried, in order, when the configured address is 0. */
         private val PROBE_ADDRS = intArrayOf(
             CivModels.ADDR_IC7300,
@@ -1283,14 +1275,20 @@ class CivClient(
     override fun frequencyHz(): Long = freqHz.get()
 
     override fun setSampleRate(hz: Int) {
-        // The "rate" of a scope-only stream is its span. Snap the request to
-        // a span the scope accepts, then trust only the sweep headers to
-        // report what is actually in force.
-        if (scopeCaps == null) return
-        val target = hz.toLong()
-        val span = SCOPE_SPANS.minByOrNull { kotlin.math.abs(it - target) }!!
-        val frame = P.scopeSetSpan(rigAddr(), 0, span) ?: return
-        if (transact(frame, P.CMD_SCOPE) != null) spanHz.set(span)
+        // The "rate" of a scope-only stream is its span. The app already
+        // chooses from the exact model ladder; silently snapping here would
+        // make its axis disagree with the physical scope.
+        val caps = scopeCaps ?: throw IllegalStateException("CI-V rig has no scope span control")
+        val span = hz.toLong()
+        if (span !in caps.spansHz) {
+            throw IllegalArgumentException("CI-V scope span $span Hz is unsupported by ${modelName()}")
+        }
+        val frame = P.scopeSetSpan(rigAddr(), 0, span)
+            ?: throw IllegalArgumentException("CI-V scope span $span Hz is not encodable")
+        if (transact(frame, P.CMD_SCOPE) == null) {
+            throw IllegalStateException("CI-V scope span $span Hz was not confirmed")
+        }
+        spanHz.set(span)
     }
 
     override fun sampleRateHz(): Int = spanHz.get().toInt()
