@@ -58,10 +58,10 @@ object CivProtocol {
 
     /**
      * Longest legal frame body this codec will accept between the preamble
-     * and the terminator. Scope data frames on current rigs stay well under
-     * this; anything longer is line noise that swallowed a terminator.
+     * and the terminator. LAN CI-V may carry the entire 689-bin IC-7610
+     * sweep in one frame instead of the USB division sequence.
      */
-    const val MAX_BODY = 256
+    const val MAX_BODY = 1024
 
     // ---- commands -----------------------------------------------------------
 
@@ -273,7 +273,7 @@ object CivProtocol {
      * optional filter byte; callers must not turn that absence into a FIL
      * confirmation.
      */
-    data class ModeState(val mode: Int, val data: Boolean, val filter: Int?)
+    data class ModeState(val mode: Int, val data: Boolean, val filter: Int?, val dataMode: Int = if (data) 1 else 0)
 
     /** Read the selected VFO mode, DATA flag and IF filter. */
     fun readModeData(to: Int): ByteArray = buildFrame(
@@ -292,8 +292,11 @@ object CivProtocol {
     }
 
     /** Selected-VFO mode with the explicit DATA flag (0x26 sub 0x00). */
-    fun writeModeData(to: Int, mode: Int, data: Boolean, filter: Int): ByteArray? {
-        if (mode !in 0..0x23 || filter !in 1..3) return null
+    fun writeModeData(to: Int, mode: Int, data: Boolean, filter: Int): ByteArray? =
+        writeModeData(to, mode, if (data) 1 else 0, filter)
+
+    fun writeModeData(to: Int, mode: Int, dataMode: Int, filter: Int): ByteArray? {
+        if (mode !in 0..0x23 || dataMode !in 0..3 || filter !in 1..3) return null
         return buildFrame(
             to,
             CONTROLLER_ADDR,
@@ -301,7 +304,7 @@ object CivProtocol {
                 CMD_MODE_DATA.toByte(),
                 SUB_MODE_DATA_SELECTED.toByte(),
                 mode.toByte(),
-                if (data) 1 else 0,
+                dataMode.toByte(),
                 filter.toByte(),
             ),
         )
@@ -322,8 +325,8 @@ object CivProtocol {
         val mode = data[1].toInt() and 0xFF
         val dataFlag = data[2].toInt() and 0xFF
         val filter = data[3].toInt() and 0xFF
-        if (mode > 0x23 || dataFlag !in 0..1 || filter !in 1..3) return null
-        return ModeState(mode, dataFlag == 1, filter)
+        if (mode > 0x23 || dataFlag !in 0..3 || filter !in 1..3) return null
+        return ModeState(mode, dataFlag != 0, filter, dataFlag)
     }
 
     fun setPtt(to: Int, on: Boolean): ByteArray =
@@ -468,11 +471,12 @@ object CivProtocol {
     }
 
     /**
-     * Width-code table index for [hz] in the given operating mode, snapped
-     * to the nearest code the rig accepts.
+     * Exact width-code table index for [hz] in the given operating mode.
+     * Values between supported steps are refused rather than silently rounded.
      *
-     * SSB/CW/RTTY share one table: codes 0..9 are 50..500 Hz in 50 Hz
-     * steps, 10..40 are 600..3600 Hz in 100 Hz steps. AM has its own:
+     * SSB/CW/RTTY start at codes 0..9 for 50..500 Hz in 50 Hz
+     * steps, then 100 Hz steps. SSB/CW end at code40 (3600 Hz),
+     * RTTY at code31 (2700 Hz). AM has its own:
      * codes 0..49 are 200..10000 Hz in 200 Hz steps. FM (and anything
      * else) has no width command — null.
      */
@@ -480,9 +484,9 @@ object CivProtocol {
         val codeToHz: (Int) -> Int
         val maxCode: Int
         when (mode) {
-            MODE_LSB, MODE_USB, MODE_CW, MODE_CW_R, MODE_RTTY, MODE_RTTY_R -> {
+            MODE_LSB, MODE_USB, MODE_CW, MODE_CW_R, MODE_RTTY, MODE_RTTY_R, 0x12, 0x13 -> {
                 codeToHz = { c -> if (c <= 9) 50 * (c + 1) else 600 + 100 * (c - 10) }
-                maxCode = 40
+                maxCode = if (mode == MODE_RTTY || mode == MODE_RTTY_R) 31 else 40
             }
             MODE_AM -> {
                 codeToHz = { c -> 200 * (c + 1) }
@@ -490,7 +494,17 @@ object CivProtocol {
             }
             else -> return null
         }
-        return (0..maxCode).minByOrNull { kotlin.math.abs(codeToHz(it) - hz) }
+        return (0..maxCode).firstOrNull { codeToHz(it) == hz }
+    }
+
+    fun widthHzForCode(mode: Int, code: Int): Int? = when (mode) {
+        MODE_LSB, MODE_USB, MODE_CW, MODE_CW_R, MODE_RTTY, MODE_RTTY_R, 0x12, 0x13 -> when {
+            code in 0..9 -> 50 * (code + 1)
+            code in 10..(if (mode == MODE_RTTY || mode == MODE_RTTY_R) 31 else 40) -> 600 + 100 * (code - 10)
+            else -> null
+        }
+        MODE_AM -> if (code in 0..49) 200 * (code + 1) else null
+        else -> null
     }
 
     /**
@@ -510,6 +524,24 @@ object CivProtocol {
             byteArrayOf(CMD_MEM.toByte(), SUB_MEM_FILTER_WIDTH.toByte(), bcd.toByte()),
         )
     }
+
+    fun readFilterWidth(to: Int): ByteArray = buildFrame(
+        to, CONTROLLER_ADDR, byteArrayOf(CMD_MEM.toByte(), SUB_MEM_FILTER_WIDTH.toByte()),
+    )!!
+
+    fun parseFilterWidth(data: ByteArray): Int? =
+        if (data.size == 2 && data[0].toInt() and 0xFF == SUB_MEM_FILTER_WIDTH)
+            fromBcdBe(byteArrayOf(data[1]))?.toInt() else null
+
+    fun parseFunc(data: ByteArray, sub: Int): Int? =
+        if (data.size == 2 && data[0].toInt() and 0xFF == sub) data[1].toInt() and 0xFF else null
+
+    fun readAttenuator(to: Int): ByteArray = buildFrame(
+        to, CONTROLLER_ADDR, byteArrayOf(CMD_ATTENUATOR.toByte()),
+    )!!
+
+    fun parseAttenuator(data: ByteArray): Int? =
+        if (data.size == 1) fromBcdBe(data)?.toInt() else null
 
     fun readMeter(to: Int, sub: Int): ByteArray =
         buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_READ_METER.toByte(), sub.toByte()))!!
@@ -545,7 +577,7 @@ object CivProtocol {
      * steps, so the caller reads back what actually stuck.
      */
     fun scopeSetSpan(to: Int, id: Int, spanHz: Long): ByteArray? {
-        if (id > 1 || id < 0 || spanHz !in 0..MAX_FREQ_HZ) return null
+        if (id > 1 || id < 0 || spanHz !in 2..MAX_FREQ_HZ || spanHz % 2 != 0L) return null
         val bcd = toBcdLe(spanHz / 2, 5) ?: return null
         return buildFrame(
             to, CONTROLLER_ADDR,
@@ -560,6 +592,21 @@ object CivProtocol {
             byteArrayOf(CMD_SCOPE.toByte(), SUB_SCOPE_SPAN.toByte(), id.toByte()),
         )
     }
+
+    /** Full displayed width from the selected scope's 0x27/0x15 read-back. */
+    fun parseScopeSpan(data: ByteArray, id: Int): Long? {
+        if (data.size != 7 || data[0].toInt() != SUB_SCOPE_SPAN || data[1].toInt() != id) return null
+        return fromBcdLe(data.copyOfRange(2, 7))?.takeIf { it > 0 }?.times(2)
+    }
+
+    fun readScopeMode(to: Int, id: Int): ByteArray? {
+        if (id !in 0..1) return null
+        return buildFrame(to, CONTROLLER_ADDR, byteArrayOf(CMD_SCOPE.toByte(), SUB_SCOPE_MODE.toByte(), id.toByte()))
+    }
+
+    fun parseScopeMode(data: ByteArray, id: Int): Int? =
+        data.takeIf { it.size == 3 && it[0].toInt() == SUB_SCOPE_MODE && it[1].toInt() == id }
+            ?.get(2)?.toInt()?.takeIf { it in 0..3 }
 
     /**
      * Reference level of scope [id], in half-dB steps (-20.0..+20.0 dB): the
@@ -583,10 +630,10 @@ object CivProtocol {
     /** What one received frame means to the controller. */
     sealed class Frame {
         /** `FE FE <to> <from> FB FD` */
-        data class Ack(val from: Int) : Frame()
+        data class Ack(val from: Int, val to: Int = CONTROLLER_ADDR) : Frame()
 
         /** `FE FE <to> <from> FA FD` */
-        data class Nak(val from: Int) : Frame()
+        data class Nak(val from: Int, val to: Int = CONTROLLER_ADDR) : Frame()
 
         /** Solicited reply or unsolicited transceive data. */
         class Message(val to: Int, val from: Int, val cmd: Int, val data: ByteArray) : Frame()
@@ -661,8 +708,8 @@ object CivProtocol {
         val to = body[0].toInt() and 0xFF
         val from = body[1].toInt() and 0xFF
         return when (val cmd = body[2].toInt() and 0xFF) {
-            ACK -> Frame.Ack(from)
-            NAK -> Frame.Nak(from)
+            ACK -> if (body.size == 3) Frame.Ack(from, to) else null
+            NAK -> if (body.size == 3) Frame.Nak(from, to) else null
             else -> Frame.Message(to, from, cmd, body.copyOfRange(3, body.size))
         }
     }
@@ -716,7 +763,7 @@ object CivProtocol {
      * data than the line holds — drops the sweep rather than rendering a
      * spectrum whose axis or bins are wrong.
      */
-    class ScopeAssembler(private val lineLength: Int) {
+    class ScopeAssembler(private val lineLength: Int, private val levelMax: Int = 255) {
         private val pending = arrayOfNulls<PendingLine>(2)
 
         /** Sweeps discarded for failing validation. */
@@ -728,7 +775,8 @@ object CivProtocol {
          * the two sub-command bytes). Returns the finished line when this
          * frame completes a sweep.
          */
-        fun push(data: ByteArray): ScopeLine? {
+        fun push(data: ByteArray, frequencyBytes: Int = 5): ScopeLine? {
+            require(frequencyBytes == 0 || frequencyBytes == 5 || frequencyBytes == 6)
             if (data.size < 3) {
                 dropped++
                 return null
@@ -739,30 +787,53 @@ object CivProtocol {
                 return null
             }
             val division = fromBcdBe(byteArrayOf(data[1]))?.toInt() ?: run {
+                pending[id] = null
                 dropped++
                 return null
             }
             val maxDivision = fromBcdBe(byteArrayOf(data[2]))?.toInt()
-            if (maxDivision == null || maxDivision < 1) {
+            if (maxDivision == null || maxDivision < 1 || division !in 1..maxDivision) {
+                pending[id] = null
                 dropped++
                 return null
             }
 
+            val hardwareDivisions = when (lineLength) { 475 -> 11; 689 -> 15; else -> null }
+            if (hardwareDivisions != null && maxDivision != 1 && maxDivision != hardwareDivisions) {
+                pending[id] = null; dropped++; return null
+            }
             val payloadStart: Int
             if (division == 1) {
-                // Header frame: mode, two 5-byte BCD frequency fields, range flag.
-                if (data.size < 15) {
+                // Only CENTER carries centre + half-span. Both scroll modes
+                // carry lower/upper edges. On IC-905's 10 GHz band absolute
+                // frequencies use six bytes; the half-span remains five.
+                val modeByte = data.getOrNull(3)?.toInt()?.and(0xFF) ?: -1
+                val freqBytes = if (frequencyBytes == 0) {
+                    // IC-905: the header division has no bins on USB; LAN
+                    // carries exactly one full sweep after the same header.
+                    val headerSize = data.size - if (maxDivision == 1 && data.size >= lineLength + 15) lineLength else 0
+                    when (headerSize) {
+                        15 -> 5
+                        16 -> if (modeByte == 0) 6 else -1
+                        17 -> if (modeByte in 1..3) 6 else -1
+                        else -> -1
+                    }
+                } else frequencyBytes
+                if (freqBytes !in 5..6) { pending[id] = null; dropped++; return null }
+                val secondBytes = if (modeByte == 0) 5 else freqBytes
+                val headerLength = 5 + freqBytes + secondBytes
+                if (data.size < headerLength) {
                     pending[id] = null
                     dropped++
                     return null
                 }
-                val modeByte = data[3].toInt() and 0xFF
-                val fa = fromBcdLe(data.copyOfRange(4, 9)) ?: run {
+                val first = data.copyOfRange(4, 4 + freqBytes)
+                val fa = (if (modeByte in 1..3) scopeEdge(first) else fromBcdLe(first)) ?: run {
                     pending[id] = null
                     dropped++
                     return null
                 }
-                val fb = fromBcdLe(data.copyOfRange(9, 14)) ?: run {
+                val fb = fromBcdLe(data.copyOfRange(4 + freqBytes, headerLength - 1)) ?: run {
                     pending[id] = null
                     dropped++
                     return null
@@ -773,7 +844,7 @@ object CivProtocol {
                 when (modeByte) {
                     0x00 -> { mode = ScopeMode.CENTER; low = fa - fb; high = fa + fb }
                     0x01 -> { mode = ScopeMode.FIXED; low = fa; high = fb }
-                    0x02 -> { mode = ScopeMode.SCROLL_CENTER; low = fa - fb; high = fa + fb }
+                    0x02 -> { mode = ScopeMode.SCROLL_CENTER; low = fa; high = fb }
                     0x03 -> { mode = ScopeMode.SCROLL_FIXED; low = fa; high = fb }
                     else -> {
                         pending[id] = null
@@ -781,13 +852,20 @@ object CivProtocol {
                         return null
                     }
                 }
-                if (high <= low) {
+                val range = data[headerLength - 1].toInt() and 0xFF
+                if (high <= low || high - low > Int.MAX_VALUE || range !in 0..1) {
                     pending[id] = null
                     dropped++
                     return null
                 }
-                pending[id] = PendingLine(mode, low, high, data[14].toInt() != 0, maxDivision)
-                payloadStart = 15
+                // Out-of-range is an explicit state, not an empty/partial FFT.
+                // The radio may stop sending divisions after this header.
+                if (range == 1) {
+                    pending[id] = null
+                    return ScopeLine(id, mode, low, high, true, ByteArray(0))
+                }
+                pending[id] = PendingLine(mode, low, high, false, maxDivision)
+                payloadStart = headerLength
             } else {
                 val p = pending[id]
                     // Data frame with no header seen: mid-sweep join, wait
@@ -802,6 +880,14 @@ object CivProtocol {
             }
 
             val p = pending[id]!!
+            val count = data.size - payloadStart
+            if (hardwareDivisions != null && maxDivision > 1 && count != when (division) {
+                    1 -> 0
+                    maxDivision -> lineLength % 50
+                    else -> 50
+                } || (payloadStart until data.size).any { data[it].toInt() and 0xFF > levelMax }) {
+                pending[id] = null; dropped++; return null
+            }
             if (p.bins.size + (data.size - payloadStart) > lineLength) {
                 pending[id] = null
                 dropped++
@@ -812,7 +898,7 @@ object CivProtocol {
 
             if (division == p.maxDivision) {
                 pending[id] = null
-                if (p.bins.isEmpty()) {
+                if (p.bins.size != lineLength) {
                     dropped++
                     return null
                 }
@@ -821,6 +907,14 @@ object CivProtocol {
                 )
             }
             return null
+        }
+
+        /** The high nibble F denotes a negative magnitude, not ten's complement. */
+        private fun scopeEdge(bytes: ByteArray): Long? {
+            if ((bytes.last().toInt() and 0xF0) != 0xF0) return fromBcdLe(bytes)
+            val magnitude = bytes.copyOf()
+            magnitude[magnitude.lastIndex] = (magnitude.last().toInt() and 0x0F).toByte()
+            return fromBcdLe(magnitude)?.let { -it }
         }
     }
 

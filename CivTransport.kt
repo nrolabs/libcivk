@@ -98,15 +98,13 @@ class TcpTransport(host: String, port: Int) : CivTransport {
 }
 
 /**
- * CI-V over the rig's built-in USB serial port (CDC-ACM class device on the
- * Android USB host bus). Also matches the standalone USB-serial bridges that
- * expose a CDC data interface.
+ * CI-V over Silicon Labs CP210x or CDC-ACM on the Android USB host bus.
  *
  * [open] must complete before the transport is handed to the client: it
- * enumerates the first device with a CDC data interface, walks the Android
+ * enumerates a supported serial interface, walks the Android
  * USB permission dialog, claims both the communication and data interfaces,
- * and programs the line coding ([baud] 8N1) with DTR/RTS asserted — some
- * rigs gate their CI-V echo on the control lines.
+ * and verifies the line coding ([baud] 8N1). DTR/RTS remain inactive because
+ * radios can assign those lines to SEND/CW.
  */
 class UsbCdcTransport(
     private val context: Context,
@@ -129,6 +127,7 @@ class UsbCdcTransport(
     }
 
     private var connection: UsbDeviceConnection? = null
+    private var cp210xInterface: Int? = null
     private var commInterface: UsbInterface? = null
     private var dataInterface: UsbInterface? = null
     private var endpointIn: UsbEndpoint? = null
@@ -143,82 +142,75 @@ class UsbCdcTransport(
      * Find, get permission for, and configure a CDC serial device. False
      * when no device is present, permission was denied, or the claim failed.
      */
-    suspend fun open(): Boolean {
+    suspend fun open(probeCivAddress: Int? = null): Boolean {
         val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
-        val device = usbManager.deviceList.values.firstOrNull { hasCdcDataInterface(it) }
-        if (device == null) {
-            Log.w(TAG, "no USB CDC serial device attached")
+        val devices = usbManager.deviceList.values.filter {
+            hasCdcDataInterface(it) || CivUsbSerialProtocol.isCp210x(it.vendorId, it.productId)
+        }
+        if (devices.isEmpty()) {
+            Log.w(TAG, "no supported USB serial device attached")
             return false
         }
-        if (!usbManager.hasPermission(device) && !requestPermission(usbManager, device)) {
-            Log.w(TAG, "USB permission denied for ${device.deviceName}")
-            return false
-        }
-        val conn = usbManager.openDevice(device) ?: return false
-
-        var comm: UsbInterface? = null
-        var data: UsbInterface? = null
-        for (i in 0 until device.interfaceCount) {
-            val iface = device.getInterface(i)
-            when (iface.interfaceClass) {
-                UsbConstants.USB_CLASS_COMM -> if (comm == null) comm = iface
-                UsbConstants.USB_CLASS_CDC_DATA -> if (data == null) data = iface
+        for (device in devices) {
+            if (!usbManager.hasPermission(device) && !requestPermission(usbManager, device)) {
+                Log.w(TAG, "USB permission denied for ${device.deviceName}")
+                continue
             }
-        }
-        if (data == null) {
-            conn.close()
-            return false
-        }
-        var epIn: UsbEndpoint? = null
-        var epOut: UsbEndpoint? = null
-        for (i in 0 until data.endpointCount) {
-            val ep = data.getEndpoint(i)
-            if (ep.type != UsbConstants.USB_ENDPOINT_XFER_BULK) continue
-            if (ep.direction == UsbConstants.USB_DIR_IN) epIn = ep else epOut = ep
-        }
-        if (epIn == null || epOut == null) {
-            conn.close()
-            return false
-        }
-        if (comm != null && !conn.claimInterface(comm, true)) {
-            conn.close()
-            return false
-        }
-        if (!conn.claimInterface(data, true)) {
+            val conn = usbManager.openDevice(device) ?: continue
+
+            val cp210x = CivUsbSerialProtocol.isCp210x(device.vendorId, device.productId)
+            val interfaces = (0 until device.interfaceCount).map(device::getInterface)
+            val comm = if (cp210x) null else interfaces.firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_COMM }
+            val candidates = interfaces.filter {
+                it.interfaceClass == if (cp210x) UsbConstants.USB_CLASS_VENDOR_SPEC else UsbConstants.USB_CLASS_CDC_DATA
+            }.sortedBy { it.id }
+            if (comm != null && !conn.claimInterface(comm, true)) { conn.close(); continue }
+            for (data in candidates) {
+                val endpoints = (0 until data.endpointCount).map(data::getEndpoint)
+                    .filter { it.type == UsbConstants.USB_ENDPOINT_XFER_BULK }
+                val epIn = endpoints.firstOrNull { it.direction == UsbConstants.USB_DIR_IN } ?: continue
+                val epOut = endpoints.firstOrNull { it.direction == UsbConstants.USB_DIR_OUT } ?: continue
+                if (!conn.claimInterface(data, true)) continue
+                val controlIndex = if (cp210x) data.id else comm?.id ?: data.id
+                try {
+                    val transfer = { type: Int, request: Int, value: Int, index: Int, bytes: ByteArray? ->
+                        conn.controlTransfer(type, request, value, index, bytes, bytes?.size ?: 0, CONTROL_TIMEOUT_MS)
+                    }
+                    if (cp210x) CivUsbSerialProtocol.configureCp210x(baud, controlIndex, transfer)
+                    else CivUsbSerialProtocol.configureCdc(baud, controlIndex, transfer)
+                    if (probeCivAddress != null && !CivUsbSerialProtocol.probeCiv(
+                            CivUsbSerialProtocol.probeAddresses(probeCivAddress),
+                            write = { bytes ->
+                                var offset = 0
+                                while (offset < bytes.size) {
+                                    val remaining = bytes.copyOfRange(offset, bytes.size)
+                                    val count = conn.bulkTransfer(epOut, remaining, remaining.size, WRITE_TIMEOUT_MS)
+                                    if (count <= 0) throw IOException("CI-V USB probe write failed")
+                                    offset += count
+                                }
+                            },
+                            read = { bytes -> conn.bulkTransfer(epIn, bytes, bytes.size, CivTransport.READ_TIMEOUT_MS) },
+                        )) throw IOException("no correlated CI-V address reply on UART ${data.id}")
+
+                    cp210xInterface = if (cp210x) controlIndex else null
+                    connection = conn
+                    commInterface = comm
+                    dataInterface = data
+                    endpointIn = epIn
+                    endpointOut = epOut
+                    registerDetachReceiver(device)
+                    Log.i(TAG, "opened ${device.deviceName} interface ${data.id} at $baud baud")
+                    return true
+                } catch (e: Exception) {
+                    Log.w(TAG, "USB serial interface ${data.id} rejected: ${e.message}")
+                    if (cp210x) conn.controlTransfer(0x41, 0x00, 0, controlIndex, null, 0, CONTROL_TIMEOUT_MS)
+                    conn.releaseInterface(data)
+                }
+            }
             comm?.let { conn.releaseInterface(it) }
             conn.close()
-            return false
         }
-
-        // Line coding: dwDTERate (LE), 1 stop bit, no parity, 8 data bits;
-        // then DTR|RTS so the adapter actually drives the line.
-        val controlIndex = comm?.id ?: data.id
-        val lineCoding = byteArrayOf(
-            (baud and 0xFF).toByte(),
-            ((baud shr 8) and 0xFF).toByte(),
-            ((baud shr 16) and 0xFF).toByte(),
-            ((baud shr 24) and 0xFF).toByte(),
-            0, // 1 stop bit
-            0, // no parity
-            8, // 8 data bits
-        )
-        conn.controlTransfer(
-            REQTYPE_CLASS_INTERFACE_OUT, SET_LINE_CODING, 0, controlIndex,
-            lineCoding, lineCoding.size, CONTROL_TIMEOUT_MS,
-        )
-        conn.controlTransfer(
-            REQTYPE_CLASS_INTERFACE_OUT, SET_CONTROL_LINE_STATE, 0x03, controlIndex,
-            null, 0, CONTROL_TIMEOUT_MS,
-        )
-
-        connection = conn
-        commInterface = comm
-        dataInterface = data
-        endpointIn = epIn
-        endpointOut = epOut
-        registerDetachReceiver(device)
-        Log.i(TAG, "opened ${device.deviceName} at $baud baud")
-        return true
+        return false
     }
 
     private fun hasCdcDataInterface(device: UsbDevice): Boolean {
@@ -246,7 +238,7 @@ class UsbCdcTransport(
         while (off < bytes.size) {
             val chunk = if (off == 0) bytes else bytes.copyOfRange(off, bytes.size)
             val n = conn.bulkTransfer(ep, chunk, chunk.size, WRITE_TIMEOUT_MS)
-            if (n < 0) throw IOException("bulk write failed")
+            if (n <= 0) throw IOException("bulk write made no progress")
             off += n
         }
     }
@@ -268,6 +260,8 @@ class UsbCdcTransport(
         val conn = connection ?: return
         connection = null
         try {
+            cp210xInterface?.let { conn.controlTransfer(0x41, 0x00, 0, it, null, 0, CONTROL_TIMEOUT_MS) }
+            cp210xInterface = null
             dataInterface?.let { conn.releaseInterface(it) }
             commInterface?.let { conn.releaseInterface(it) }
         } catch (_: Exception) {

@@ -31,13 +31,13 @@ import com.isaklab.isdrproto.CatRepeater
 object CivModels {
 
     val COMMON_SCOPE_SPANS_HZ = listOf(
-        2_500L, 5_000L, 10_000L, 25_000L, 50_000L, 100_000L, 250_000L, 500_000L,
+        5_000L, 10_000L, 20_000L, 50_000L, 100_000L, 200_000L, 500_000L, 1_000_000L,
     )
 
-    val R8600_SCOPE_SPANS_HZ = COMMON_SCOPE_SPANS_HZ + listOf(1_000_000L, 2_500_000L)
+    val R8600_SCOPE_SPANS_HZ = COMMON_SCOPE_SPANS_HZ + listOf(2_000_000L, 5_000_000L)
 
     val IC905_SCOPE_SPANS_HZ = COMMON_SCOPE_SPANS_HZ +
-        listOf(1_000_000L, 2_500_000L, 5_000_000L, 10_000_000L, 25_000_000L)
+        listOf(2_000_000L, 5_000_000L, 10_000_000L, 20_000_000L, 50_000_000L)
 
     /** Geometry and level scale of a rig's scope waveform. */
     data class ScopeCaps(
@@ -49,14 +49,13 @@ object CivModels {
         val dbMin: Float,
         /** Top of the scale on the display, in dB. */
         val dbMax: Float,
-        /** Exact centre-mode spans the identified model accepts. */
+        /** Exact full displayed widths; CI-V 0x27/0x15 carries half this value. */
         val spansHz: List<Long>,
     ) {
         companion object {
             /**
-             * The waveform format is identical across every scope-capable
-             * rig to date: 475 bins, amplitude 0..160 spanning an 80 dB
-             * window.
+             * The 475-bin family uses amplitude 0..160 over its 80 dB
+             * display window. IC-7610 has its own geometry below.
              */
             fun standard(spansHz: List<Long> = COMMON_SCOPE_SPANS_HZ) = ScopeCaps(
                 lineLength = 475,
@@ -88,7 +87,8 @@ object CivModels {
 
     /** Scope geometry for a bus address; null for control-only rigs. */
     fun scopeCaps(addr: Int): ScopeCaps? = when (addr) {
-        ADDR_IC7300, ADDR_IC7610, ADDR_IC9700, ADDR_IC705 -> ScopeCaps.standard()
+        ADDR_IC7300, ADDR_IC9700, ADDR_IC705 -> ScopeCaps.standard()
+        ADDR_IC7610 -> ScopeCaps(689, 200, -100f, 0f, COMMON_SCOPE_SPANS_HZ)
         ADDR_IC905 -> ScopeCaps.standard(IC905_SCOPE_SPANS_HZ)
         ADDR_ICR8600 -> ScopeCaps.standard(R8600_SCOPE_SPANS_HZ)
         else -> null
@@ -109,7 +109,7 @@ object CivModels {
             CatRepeater.CAP_DCS_TX or CatRepeater.CAP_DCS_RX or
             CatRepeater.CAP_DCS_POLARITY or CatRepeater.CAP_CROSS_TONE
         return when (addr) {
-            ADDR_IC7300 -> RigCaps(true, ctcss, 0, 0, true)
+            ADDR_IC7300 -> RigCaps(true, ctcss, 0, 0, false)
             ADDR_IC705 -> RigCaps(true, full, 3, 100, true)
             ADDR_IC7610 -> RigCaps(true, ctcss, 0, 0, false)
             ADDR_IC9700 -> RigCaps(true, full, 3, 100, true)
@@ -127,6 +127,50 @@ object CivModels {
             else -> RigCaps(true, 0, 0, 0, false)
         }
     }
+
+    fun supportsMode(addr: Int, mode: Int, data: Boolean): Boolean {
+        if (data && mode !in listOf(0, 1, 2, 5)) return false
+        return when (mode) {
+            in 0..5, 7, 8 -> true
+            6 -> !data && addr in listOf(ADDR_IC705, ADDR_ICR8600)
+            0x12, 0x13 -> !data && addr in listOf(ADDR_IC7610, ADDR_IC7851)
+            else -> false
+        }
+    }
+
+    fun preampMax(addr: Int, rxHz: Long): Int = when (addr) {
+        ADDR_IC9700 -> 3
+        ADDR_IC905, ADDR_ICR8600 -> 1
+        ADDR_IC705 -> if (rxHz in 144_000_000L until 148_000_000L || rxHz in 430_000_000L until 450_000_000L) 1 else 2
+        else -> 2
+    }
+
+    fun attenuatorAllowed(addr: Int, rxHz: Long, db: Int): Boolean = when (addr) {
+        ADDR_IC7300 -> db == 0 || db == 20
+        ADDR_IC705 -> db == 0 || db == 20 &&
+            rxHz !in 144_000_000L until 148_000_000L && rxHz !in 430_000_000L until 450_000_000L
+        ADDR_IC7610 -> db in 0..45 && db % 3 == 0
+        ADDR_IC7851 -> db in 0..21 && db % 3 == 0
+        ADDR_IC9700 -> db == 0 || db == 10
+        ADDR_IC905 -> db == 0 || db == 10 && rxHz < 1_300_000_000L
+        ADDR_ICR8600 -> db in 0..30 && db % 10 == 0
+        else -> db in 0..45
+    }
+
+    private fun interpolate(raw: Int, points: List<Pair<Int, Double>>): Double {
+        if (raw <= points.first().first) return points.first().second
+        for ((a, b) in points.zipWithNext()) if (raw <= b.first) {
+            return a.second + (raw - a.first).toDouble() / (b.first - a.first) * (b.second - a.second)
+        }
+        return points.last().second
+    }
+
+    /** Display-meter interpolation between published CI-V anchors; not RF calibration. */
+    fun smeterDbm(raw: Int): Double = interpolate(raw, listOf(0 to -127.0, 120 to -73.0, 241 to -13.0))
+    fun powerFraction(addr: Int, raw: Int): Double = interpolate(raw, listOf(
+        0 to 0.0, 143 to 0.5, (if (addr == ADDR_IC7610) 212 else 213) to 1.0, 255 to 1.2,
+    ))
+    fun swr(raw: Int): Double = interpolate(raw, listOf(0 to 1.0, 48 to 1.5, 80 to 2.0, 120 to 3.0, 240 to 6.0))
 
     /** Native offset maximum at the current receive frequency. */
     fun repeaterMaxOffsetHz(addr: Int, rxHz: Long): Long = when (addr) {

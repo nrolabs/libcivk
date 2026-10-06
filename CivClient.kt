@@ -55,6 +55,9 @@ class CivClient(
     private val onConnectionStatusChanged: (Boolean, String) -> Unit,
     /** Expected value reported by CI-V 0x19/0x00, or null for generic discovery. */
     private val requiredReportedCivAddress: Int? = null,
+    private val onScopeData: ((Long, Long, Boolean, FloatArray) -> Unit)? = null,
+    private val onTelemetry: ((com.isaklab.isdrproto.RadioTelemetry) -> Unit)? = null,
+    private val onControl: ((Int, Int) -> Unit)? = null,
 ) : RadioClient, TransmitCapable, CatControlCapable, CatRepeaterCapable {
 
     companion object {
@@ -88,7 +91,7 @@ class CivClient(
         )
     }
 
-    private class Pending(val cmd: Int, val rigAddr: Int) {
+    private class Pending(val cmd: Int, val rigAddr: Int, val acceptsAck: Boolean, val prefix: ByteArray) {
         /** null data = NAK / rejected. */
         val reply = ArrayBlockingQueue<Result<ByteArray>>(1)
     }
@@ -112,6 +115,7 @@ class CivClient(
     private val lowEdgeHz = AtomicLong(0)
     private val highEdgeHz = AtomicLong(0)
     private val modeCode = AtomicInteger(-1)
+    private val modeReadbackPending = AtomicBoolean(false)
     private val ptt = AtomicBoolean(false)
     private val running = AtomicBoolean(false)
     private val rigAddrAtomic = AtomicInteger(this.configuredAddr)
@@ -119,7 +123,10 @@ class CivClient(
     private val outgoing = LinkedBlockingQueue<OutgoingFrame>()
     private val pendingLock = Object()
     private val busLock = Object()
+    @Volatile private var controlFailure: String? = null
+    private val reportedControls = java.util.concurrent.ConcurrentHashMap<Int, Int>()
     private val readerCycle = AtomicLong(0)
+    private val operatorWaiting = AtomicInteger(0)
     private var pending: Pending? = null
 
     @Volatile private var activeRepeater: CatRepeaterConfig? = null
@@ -130,6 +137,7 @@ class CivClient(
     private val repeaterCancel = AtomicBoolean(false)
 
     private var reader: Thread? = null
+    private var poller: Thread? = null
     private var started = false
     private var scopeCaps: CivModels.ScopeCaps? = null
     @Volatile private var stateListener: (() -> Unit)? = null
@@ -139,12 +147,10 @@ class CivClient(
     override var spectrumEnabled: Boolean
         get() = spectrumWanted
         set(value) {
-            spectrumWanted = value
-            // ACK/NAK has no command tag, so even this UI control uses the
-            // same serialized transaction boundary as RF-affecting writes.
-            if (scopeCaps != null) {
-                transact(P.scopeWaveOutput(rigAddr(), value), P.CMD_SCOPE)
+            if (scopeCaps != null && !setScopeSwitchConfirmed(P.SUB_SCOPE_WAVE_OUTPUT, value)) {
+                throw IllegalStateException("CI-V scope output setting was not confirmed")
             }
+            spectrumWanted = value
         }
 
     override fun setStateListener(listener: (() -> Unit)?) {
@@ -184,6 +190,17 @@ class CivClient(
         cmd: Int,
         cancellable: Boolean = false,
     ): Result<ByteArray> {
+        val background = Thread.currentThread() === poller
+        // A paired poll already holding the bus must finish before yielding:
+        // the waiting operator needs this same monitor to make progress.
+        if (background && !Thread.holdsLock(busLock)) {
+            while (running.get() && operatorWaiting.get() > 0) Thread.sleep(5)
+        } else if (!background) operatorWaiting.incrementAndGet()
+        return try { transactOnBus(frame, cmd, cancellable) }
+        finally { if (!background) operatorWaiting.decrementAndGet() }
+    }
+
+    private fun transactOnBus(frame: ByteArray, cmd: Int, cancellable: Boolean): Result<ByteArray> {
         if (!running.get()) return Result.failure(IllegalStateException("not connected"))
         return synchronized(busLock) {
             if (cancellable && repeaterCancel.get()) {
@@ -193,7 +210,17 @@ class CivClient(
                 ?: return@synchronized Result.failure(
                     IllegalArgumentException("malformed outgoing CI-V frame"),
                 )
-            val p = Pending(cmd, target)
+            val data = frame.copyOfRange(5, frame.size - 1)
+            val selectorLength = when (cmd) {
+                P.CMD_READ_FREQ, P.CMD_READ_MODE, P.CMD_READ_REPEATER_OFFSET,
+                P.CMD_DUPLEX, P.CMD_ATTENUATOR -> 0
+                P.CMD_SCOPE -> if (data.firstOrNull()?.toInt() in 0x14..0x1B || data.firstOrNull()?.toInt() == 0x1D) 2 else 1
+                else -> 1
+            }
+            val alwaysWrites = cmd in setOf(P.CMD_WRITE_FREQ, P.CMD_WRITE_MODE, P.CMD_SET_REPEATER_OFFSET)
+            val alwaysReads = cmd in setOf(P.CMD_READ_FREQ, P.CMD_READ_MODE, P.CMD_READ_REPEATER_OFFSET, P.CMD_READ_METER, P.CMD_READ_ID)
+            val reads = !alwaysWrites && (alwaysReads || data.size == selectorLength)
+            val p = Pending(cmd, target, !reads, if (reads) data.copyOf(minOf(data.size, selectorLength)) else ByteArray(0))
             synchronized(pendingLock) { pending = p }
             var attempts = 0
             var sent = 0
@@ -292,7 +319,7 @@ class CivClient(
     // ---- rig control --------------------------------------------------------
 
     /** The rig IF filter (FIL1..3) the last mode write carried. */
-    private var lastFil = 1
+    @Volatile private var lastFil = 1
 
     /**
      * Set the operating mode (CI-V mode code), carrying the rig IF filter
@@ -300,16 +327,17 @@ class CivClient(
      */
     fun setMode(mode: Int): Boolean = setModeWithFilter(mode, lastFil, requireFilter = false)
 
-    private fun setModeWithFilter(mode: Int, filter: Int, requireFilter: Boolean): Boolean {
+    private fun setModeWithFilter(mode: Int, filter: Int, requireFilter: Boolean, dataModeOverride: Int? = null): Boolean {
         if (repeaterInFlight.get()) return false
         val knownBits = 0xFF or DriverProto.CAT_MODE_DATA_FLAG
         if (mode and knownBits.inv() != 0) return false
         val base = mode and 0xFF
         val data = mode and DriverProto.CAT_MODE_DATA_FLAG != 0
         val addr = rigAddr()
+        if (!CivModels.supportsMode(addr, base, data)) return false
         val modeData = data || CivModels.supportsModeData(addr)
         val frame = if (modeData) {
-            P.writeModeData(addr, base, data, filter)
+            P.writeModeData(addr, base, dataModeOverride ?: if (data) 1 else 0, filter)
         } else {
             P.writeMode(addr, base, filter)
         } ?: return false
@@ -321,11 +349,11 @@ class CivClient(
         } else {
             transact(P.readMode(addr), P.CMD_READ_MODE)?.let(P::parseMode)
         } ?: return false
-        actual.filter?.let { lastFil = it }
         val actualCode = actual.mode or
             (if (actual.data) DriverProto.CAT_MODE_DATA_FLAG else 0)
-        modeCode.set(actualCode)
-        return actualCode == mode && (!requireFilter || actual.filter == filter)
+        publishMode(actual)
+        return actualCode == mode && (!requireFilter || actual.filter == filter) &&
+            (dataModeOverride == null || actual.dataMode == dataModeOverride)
     }
 
     /**
@@ -334,14 +362,21 @@ class CivClient(
      * "the rig does not have it", never as an error.
      */
     fun setControl(id: Int, value: Int): Boolean {
+        controlFailure = null
         if (repeaterInFlight.get()) return false
         val addr = rigAddr()
         return when (id) {
             // CATCTL_FIL: the mode write (0x06) carries the IF filter byte.
             1 -> {
                 if (value !in 1..3) return false
-                val mode = modeCode.get()
-                if (mode >= 0) setModeWithFilter(mode, value, requireFilter = true) else false
+                // A front-panel change may have selected D2/D3 since the last
+                // poll. FIL changes preserve that physical DATA selection.
+                val actual = if (CivModels.supportsModeData(addr)) {
+                    transact(P.readModeData(addr), P.CMD_MODE_DATA)?.let(P::parseModeData)
+                } else transact(P.readMode(addr), P.CMD_READ_MODE)?.let(P::parseMode)
+                actual ?: return false
+                setModeWithFilter(actual.mode or (if (actual.data) DriverProto.CAT_MODE_DATA_FLAG else 0),
+                    value, requireFilter = true, dataModeOverride = actual.dataMode)
             }
             // CATCTL_RF_GAIN / CATCTL_SQUELCH / CATCTL_PBT_IN /
             // CATCTL_PBT_OUT / CATCTL_AF_GAIN: plain 0..255 levels.
@@ -354,58 +389,39 @@ class CivClient(
                     11 -> P.SUB_LEVEL_PBT_OUT
                     else -> P.SUB_LEVEL_AF
                 }
-                transact(P.setLevel(addr, sub, value), P.CMD_LEVEL) != null
+                setLevelConfirmed(addr, sub, value)
             }
             // CATCTL_NR: 0 = off; 1..15 = on, then the strength on the
             // rig's 0..255 level scale (15 steps of 17).
-            4 -> {
-                if (value !in 0..15) return false
-                val on = value > 0
-                if (transact(
-                        P.setFunc(addr, P.SUB_FUNC_NR, if (on) 1 else 0), P.CMD_FUNC,
-                    ) == null
-                ) {
-                    return false
-                }
-                if (!on) return true
-                val level = value * 255 / 15
-                transact(P.setLevel(addr, P.SUB_LEVEL_NR, level), P.CMD_LEVEL) != null
-            }
+            4 -> setNrConfirmed(value)
             // CATCTL_NB / CATCTL_NOTCH_AUTO: on/off functions.
             5, 6 -> {
                 if (value !in 0..1) return false
                 val sub = if (id == 5) P.SUB_FUNC_NB else P.SUB_FUNC_NOTCH_AUTO
-                transact(P.setFunc(addr, sub, value), P.CMD_FUNC) != null
+                setFuncConfirmed(addr, sub, value)
             }
-            // CATCTL_AGC: 1 fast, 2 mid, 3 slow. These rigs have no AGC-off
-            // code on this command, so 0 is unsupported here.
+            // CATCTL_AGC: 1 fast, 2 mid, 3 slow; only IC-7851 proves 0 off.
             7 -> {
-                if (value !in 1..3) return false
-                transact(P.setFunc(addr, P.SUB_FUNC_AGC, value), P.CMD_FUNC) != null
+                if (value !in (if (addr == CivModels.ADDR_IC7851) 0 else 1)..3) return false
+                setFuncConfirmed(addr, P.SUB_FUNC_AGC, value)
             }
             // CATCTL_PREAMP: 0 off, 1/2 = stage.
             8 -> {
-                if (value !in 0..2) return false
-                transact(P.setFunc(addr, P.SUB_FUNC_PREAMP, value), P.CMD_FUNC) != null
+                if (value !in 0..CivModels.preampMax(addr, freqHz.get())) return false
+                setFuncConfirmed(addr, P.SUB_FUNC_PREAMP, value)
             }
-            // CATCTL_ATT: dB as one BCD byte, 0 = off. Accept anything the
-            // wire can carry up to 45 dB; the rig NAKs a step it lacks.
+            // CATCTL_ATT: dB as one BCD byte, gated by the exact model/band.
             9 -> {
-                if (value !in 0..45) return false
+                if (!CivModels.attenuatorAllowed(addr, freqHz.get(), value)) return false
                 val frame = P.setAttenuator(addr, value) ?: return false
-                transact(frame, P.CMD_ATTENUATOR) != null
+                transact(frame, P.CMD_ATTENUATOR) != null &&
+                    transact(P.readAttenuator(addr), P.CMD_ATTENUATOR)?.let(P::parseAttenuator) == value
             }
             // CATCTL_FILTER_WIDTH: 0x1A 0x03 with the per-mode width code.
             // 0x1A subcommands are model-family specific — only the known
             // scope-capable family is proven to put the width there, so an
             // unknown address gets false rather than a wrong setting.
-            12 -> {
-                if (scopeCaps == null) return false
-                val mode = modeCode.get()
-                if (mode < 0) return false
-                val frame = P.setFilterWidth(addr, mode, value) ?: return false
-                transact(frame, P.CMD_MEM) != null
-            }
+            12 -> setFilterWidthConfirmed(value)
             // CATCTL_RF_POWER: setting an RF-affecting value is successful
             // only after an independent read returns the exact 0..255 level.
             14 -> {
@@ -418,6 +434,129 @@ class CivClient(
                 actual == value
             }
             else -> false
+        }
+    }
+
+    private fun setLevelConfirmed(addr: Int, sub: Int, value: Int): Boolean =
+        transact(P.setLevel(addr, sub, value), P.CMD_LEVEL) != null &&
+            transact(P.readLevel(addr, sub), P.CMD_LEVEL)?.let { P.parseLevel(it, sub) } == value
+
+    private fun setFuncConfirmed(addr: Int, sub: Int, value: Int): Boolean =
+        transact(P.setFunc(addr, sub, value), P.CMD_FUNC) != null &&
+            transact(P.readFunc(addr, sub), P.CMD_FUNC)?.let { P.parseFunc(it, sub) } == value
+
+    private fun readModeConfirmed(): P.ModeState? {
+        val addr = rigAddr()
+        val actual = if (CivModels.supportsModeData(addr)) {
+            transact(P.readModeData(addr), P.CMD_MODE_DATA)?.let(P::parseModeData)
+        } else transact(P.readMode(addr), P.CMD_READ_MODE)?.let(P::parseMode)
+        actual ?: return null
+        publishMode(actual)
+        return actual
+    }
+
+    private fun publishMode(actual: P.ModeState) {
+        actual.filter?.let { lastFil = it }
+        val code = actual.mode or (if (actual.data) DriverProto.CAT_MODE_DATA_FLAG else 0)
+        val changed = modeCode.getAndSet(code) != code
+        if (changed) listOf(1, 10, 11, 12).forEach(reportedControls::remove)
+        val pendingNotification = modeReadbackPending.getAndSet(false)
+        if (changed || pendingNotification) stateListener?.invoke()
+        // Consumers clear mode-local observations when the mode changes.
+        // Their new FIL must arrive after that state transition.
+        actual.filter?.let { reportControl(1, it) }
+    }
+
+    private fun setFilterWidthConfirmed(widthHz: Int): Boolean = synchronized(busLock) {
+        val addr = rigAddr()
+        if (scopeCaps == null && addr != CivModels.ADDR_IC7851) return@synchronized false
+        // The front panel can change the mode without a transceive message.
+        // A width code is meaningful only for its mode/DATA/FIL snapshot.
+        val before = readModeConfirmed() ?: return@synchronized false
+        if (!CivModels.supportsMode(addr, before.mode, before.data)) return@synchronized false
+        val frame = P.setFilterWidth(addr, before.mode, widthHz) ?: return@synchronized false
+        if (transact(frame, P.CMD_MEM) == null) return@synchronized false
+        val code = transact(P.readFilterWidth(addr), P.CMD_MEM)?.let(P::parseFilterWidth)
+        val after = readModeConfirmed() ?: return@synchronized false
+        before == after && code != null && P.widthHzForCode(after.mode, code) == widthHz
+    }
+
+    override fun catControlError(): String? = controlFailure
+
+    private data class NrState(val on: Boolean, val level: Int) {
+        fun displayValue(): Int = if (!on) 0 else (level * 15 / 255).coerceIn(1, 15)
+    }
+
+    private fun readNrState(): NrState? {
+        val addr = rigAddr()
+        val on = transact(P.readFunc(addr, P.SUB_FUNC_NR), P.CMD_FUNC)?.let { P.parseFunc(it, P.SUB_FUNC_NR) }
+            ?.takeIf { it in 0..1 } ?: return null
+        val level = transact(P.readLevel(addr, P.SUB_LEVEL_NR), P.CMD_LEVEL)?.let { P.parseLevel(it, P.SUB_LEVEL_NR) }
+            ?: return null
+        return NrState(on == 1, level)
+    }
+
+    private fun setNrConfirmed(value: Int): Boolean = synchronized(busLock) {
+        if (value !in 0..15) return@synchronized false
+        val previous = readNrState() ?: run {
+            controlFailure = "CI-V NR state could not be read before mutation"
+            return@synchronized false
+        }
+        val requested = NrState(value > 0, if (value > 0) value * 17 else previous.level)
+        val addr = rigAddr()
+        val functionWritten = transact(P.setFunc(addr, P.SUB_FUNC_NR, if (requested.on) 1 else 0), P.CMD_FUNC) != null
+        val levelWritten = functionWritten && (!requested.on ||
+            transact(P.setLevel(addr, P.SUB_LEVEL_NR, requested.level), P.CMD_LEVEL) != null)
+        val confirmed = if (levelWritten) readNrState() else null
+        if (confirmed == requested) {
+            reportControl(4, confirmed.displayValue())
+            return@synchronized true
+        }
+        // Any failed leg may already have reached the radio. Restore the
+        // whole pair, including an inactive stored strength, then verify it.
+        val restoreLevel = transact(P.setLevel(addr, P.SUB_LEVEL_NR, previous.level), P.CMD_LEVEL) != null
+        val restoreOn = transact(P.setFunc(addr, P.SUB_FUNC_NR, if (previous.on) 1 else 0), P.CMD_FUNC) != null
+        val restored = readNrState()
+        restored?.let { reportControl(4, it.displayValue()) }
+        controlFailure = if (restoreLevel && restoreOn && restored == previous) {
+            "CI-V NR write was not confirmed; previous NR state was restored"
+        } else {
+            "CI-V NR write was not confirmed; NR rollback failed and physical state is uncertain"
+        }
+        false
+    }
+
+    private fun reportControl(id: Int, value: Int) {
+        if (reportedControls.put(id, value) != value) onControl?.invoke(id, value)
+    }
+
+    private fun readControl(id: Int): Int? {
+        val addr = rigAddr()
+        return when (id) {
+            2, 3, 10, 11, 13, 14 -> {
+                if (id == 14 && !CivModels.rigCaps(addr).hasTx) return null
+                val sub = when (id) { 2 -> P.SUB_LEVEL_RF; 3 -> P.SUB_LEVEL_SQL; 10 -> P.SUB_LEVEL_PBT_IN
+                    11 -> P.SUB_LEVEL_PBT_OUT; 13 -> P.SUB_LEVEL_AF; else -> P.SUB_LEVEL_RFPOWER }
+                transact(P.readLevel(addr, sub), P.CMD_LEVEL)?.let { P.parseLevel(it, sub) }
+            }
+            4 -> synchronized(busLock) { readNrState()?.displayValue() }
+            5, 6, 7, 8 -> {
+                val sub = when (id) { 5 -> P.SUB_FUNC_NB; 6 -> P.SUB_FUNC_NOTCH_AUTO; 7 -> P.SUB_FUNC_AGC; else -> P.SUB_FUNC_PREAMP }
+                val range = when (id) { 7 -> (if (addr == CivModels.ADDR_IC7851) 0 else 1)..3
+                    8 -> 0..CivModels.preampMax(addr, freqHz.get()); else -> 0..1 }
+                transact(P.readFunc(addr, sub), P.CMD_FUNC)?.let { P.parseFunc(it, sub) }?.takeIf { it in range }
+            }
+            9 -> transact(P.readAttenuator(addr), P.CMD_ATTENUATOR)?.let(P::parseAttenuator)
+                ?.takeIf { CivModels.attenuatorAllowed(addr, freqHz.get(), it) }
+            12 -> synchronized(busLock) {
+                if (scopeCaps == null && addr != CivModels.ADDR_IC7851) return@synchronized null
+                val before = readModeConfirmed() ?: return@synchronized null
+                if (!CivModels.supportsMode(addr, before.mode, before.data)) return@synchronized null
+                val code = transact(P.readFilterWidth(addr), P.CMD_MEM)?.let(P::parseFilterWidth)
+                val after = readModeConfirmed() ?: return@synchronized null
+                if (before == after && code != null) P.widthHzForCode(after.mode, code) else null
+            }
+            else -> null
         }
     }
 
@@ -1069,13 +1208,18 @@ class CivClient(
         }
     }
 
-    private fun enableScope() {
+    private fun setScopeSwitchConfirmed(sub: Int, on: Boolean): Boolean {
         val addr = rigAddr()
-        // Scope on, waveform routed to this port; a control-only rig NAKs
-        // both and simply stays a CAT radio.
-        transact(P.scopeOn(addr, true), P.CMD_SCOPE)
-        transact(P.scopeWaveOutput(addr, true), P.CMD_SCOPE)
+        val expected = if (on) 1 else 0
+        val set = P.buildFrame(addr, P.CONTROLLER_ADDR, byteArrayOf(P.CMD_SCOPE.toByte(), sub.toByte(), expected.toByte()))!!
+        if (transact(set, P.CMD_SCOPE) == null) return false
+        val read = P.buildFrame(addr, P.CONTROLLER_ADDR, byteArrayOf(P.CMD_SCOPE.toByte(), sub.toByte()))!!
+        val actual = transact(read, P.CMD_SCOPE) ?: return false
+        return actual.contentEquals(byteArrayOf(sub.toByte(), expected.toByte()))
     }
+
+    private fun enableScope(): Boolean =
+        setScopeSwitchConfirmed(P.SUB_SCOPE_ON, true) && setScopeSwitchConfirmed(P.SUB_SCOPE_WAVE_OUTPUT, true)
 
     // ---- reader ---------------------------------------------------------------
 
@@ -1099,10 +1243,9 @@ class CivClient(
                     for (body in deframer.push(buf, n)) {
                         val frame = P.parseFrame(body) ?: continue
                         if (P.isEcho(frame, P.CONTROLLER_ADDR)) continue
-                        if (assembler == null) {
-                            val caps = CivModels.scopeCaps(rigAddr())
-                                ?: CivModels.ScopeCaps.standard()
-                            assembler = P.ScopeAssembler(caps.lineLength)
+                        val caps = CivModels.scopeCaps(rigAddr()) ?: CivModels.ScopeCaps.standard()
+                        if (assembler == null || assemblerCaps != caps) {
+                            assembler = P.ScopeAssembler(caps.lineLength, caps.levelMax)
                             assemblerCaps = caps
                         }
                         handleFrame(frame, assembler!!, assemblerCaps!!)
@@ -1127,19 +1270,25 @@ class CivClient(
         caps: CivModels.ScopeCaps,
     ) {
         when (frame) {
-            is P.Frame.Ack -> completePending(frame.from) { Result.success(ByteArray(0)) }
-            is P.Frame.Nak -> completePending(frame.from) {
+            is P.Frame.Ack -> if (frame.to == P.CONTROLLER_ADDR) completePending(frame.from, true) { Result.success(ByteArray(0)) }
+            is P.Frame.Nak -> if (frame.to == P.CONTROLLER_ADDR) completePending(frame.from, false) {
                 Result.failure(IllegalStateException("rig rejected the command"))
             }
             is P.Frame.Message -> {
+                if (frame.from != rigAddr() || frame.to != P.CONTROLLER_ADDR && frame.to != 0) return
                 val data = frame.data
                 when {
                     frame.cmd == P.CMD_TRANSCEIVE_FREQ -> {
-                        P.parseFrequency(data)?.let { freqHz.set(it) }
+                        P.parseFrequency(data)?.let { if (freqHz.getAndSet(it) != it) stateListener?.invoke() }
                         return
                     }
                     frame.cmd == P.CMD_TRANSCEIVE_MODE -> {
-                        if (data.isNotEmpty()) modeCode.set(data[0].toInt() and 0xFF)
+                        val mode = P.parseMode(data) ?: return
+                        if (CivModels.supportsModeData(rigAddr())) {
+                            // 0x01 omits DATA. Keep the last confirmed truth
+                            // until 0x26 supplies the full selected-VFO state.
+                            modeReadbackPending.set(true)
+                        } else publishMode(mode)
                         return
                     }
                     frame.cmd == P.CMD_SCOPE && data.isNotEmpty() &&
@@ -1151,7 +1300,9 @@ class CivClient(
                 // Solicited reply: the rig echoes the command byte it answers.
                 synchronized(pendingLock) {
                     val p = pending
-                    if (p != null && p.cmd == frame.cmd && p.rigAddr == frame.from) {
+                    if (p != null && !p.acceptsAck && frame.to == P.CONTROLLER_ADDR &&
+                        p.cmd == frame.cmd && p.rigAddr == frame.from && data.size >= p.prefix.size &&
+                        p.prefix.indices.all { data[it] == p.prefix[it] }) {
                         pending = null
                         p.reply.offer(Result.success(data))
                     }
@@ -1160,10 +1311,10 @@ class CivClient(
         }
     }
 
-    private inline fun completePending(from: Int, result: () -> Result<ByteArray>) {
+    private inline fun completePending(from: Int, ack: Boolean, result: () -> Result<ByteArray>) {
         synchronized(pendingLock) {
             val p = pending ?: return
-            if (p.rigAddr != from) return
+            if (p.rigAddr != from || ack && !p.acceptsAck) return
             pending = null
             p.reply.offer(result())
         }
@@ -1182,7 +1333,7 @@ class CivClient(
         caps: CivModels.ScopeCaps,
         data: ByteArray,
     ) {
-        val line = assembler.push(data) ?: return
+        val line = assembler.push(data, if (rigAddr() == CivModels.ADDR_IC905) 0 else 5) ?: return
         // Sub-scope sweeps would need their own display plane; main only.
         if (line.id != 0) return
         val spanChanged = spanHz.getAndSet(line.spanHz()) != line.spanHz()
@@ -1193,7 +1344,8 @@ class CivClient(
         if (spanChanged) stateListener?.invoke()
         if (!spectrumWanted) return
         val spectrum = P.binsToDb(line.bins, caps.levelMax, caps.dbMin, caps.dbMax)
-        onDataReceived(spectrum, EMPTY_FLOATS)
+        if (onScopeData != null) onScopeData.invoke(line.lowEdgeHz, line.highEdgeHz, line.outOfRange, spectrum)
+        else if (!line.outOfRange) onDataReceived(spectrum, EMPTY_FLOATS)
     }
 
     // ---- RadioClient -----------------------------------------------------------
@@ -1274,13 +1426,22 @@ class CivClient(
 
         scopeCaps = CivModels.scopeCaps(addr)
         readInitialState()
-        if (scopeCaps != null) enableScope()
+        if (scopeCaps != null && !enableScope()) {
+            disconnect()
+            onConnectionStatusChanged(false, "CI-V scope output could not be confirmed; check USB Unlink and 115200 baud")
+            return false
+        }
         onConnectionStatusChanged(true, modelName())
+        if (onTelemetry != null || onControl != null) poller = thread(name = "civ-poll", isDaemon = true) { pollLoop() }
         return true
     }
 
     override fun disconnect() {
-        if (running.getAndSet(false)) {
+        running.set(false)
+        poller?.interrupt()
+        if (Thread.currentThread() !== poller) poller?.join()
+        poller = null
+        if (Thread.currentThread() !== reader) {
             reader?.join()
             reader = null
         }
@@ -1289,6 +1450,62 @@ class CivClient(
             transport?.close()
             transport = null
         }
+    }
+
+    private fun pollLoop() {
+        var slot = 0
+        try {
+            while (running.get()) {
+                Thread.sleep(250)
+                if (repeaterInFlight.get()) continue
+                val addr = rigAddr()
+                pollMeter()?.let { onTelemetry?.invoke(it) }
+                if (!running.get() || repeaterInFlight.get()) continue
+                readModeConfirmed()
+                if (!running.get() || repeaterInFlight.get()) continue
+                transact(P.readFrequency(addr), P.CMD_READ_FREQ)?.let(P::parseFrequency)?.let {
+                    if (freqHz.getAndSet(it) != it) stateListener?.invoke()
+                }
+                if (!running.get() || repeaterInFlight.get()) continue
+                if (CivModels.rigCaps(addr).hasTx) {
+                    val reply = transact(P.readPtt(addr), P.CMD_PTT)
+                    if (reply != null && reply.size == 2 && reply[0].toInt() == P.SUB_PTT && reply[1].toInt() in 0..1) {
+                        val on = reply[1].toInt() == 1
+                        if (ptt.getAndSet(on) != on) stateListener?.invoke()
+                    }
+                }
+                if (!running.get() || repeaterInFlight.get()) continue
+                val controls = intArrayOf(2, 3, 13, 14, 10, 11, 4, 5, 6, 7, 8, 9, 12)
+                val control = controls[slot++ % controls.size]
+                readControl(control)?.let { reportControl(control, it) }
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } catch (error: Exception) {
+            if (running.getAndSet(false)) onConnectionStatusChanged(false, "CI-V state polling failed: ${error.message}")
+            failPending(error)
+        }
+    }
+
+    private fun pollMeter(): com.isaklab.isdrproto.RadioTelemetry? = synchronized(busLock) {
+        val addr = rigAddr()
+        if (CivModels.scopeCaps(addr) == null && addr != CivModels.ADDR_IC7851) return@synchronized null
+        fun read(sub: Int): Int? = transact(P.readMeter(addr, sub), P.CMD_READ_METER)?.let { P.parseLevel(it, sub) }
+        if (!ptt.get()) {
+            val raw = read(P.SUB_METER_S) ?: return@synchronized null
+            return@synchronized com.isaklab.isdrproto.RadioTelemetry(smeterDbm = CivModels.smeterDbm(raw), hasSmeter = true)
+        }
+        val power = read(P.SUB_METER_POWER) ?: return@synchronized null
+        val forward = CivModels.powerFraction(addr, power)
+        val swr = read(P.SUB_METER_SWR)?.let(CivModels::swr)
+        // A single pair uses one Po observation. Retaining an older reverse
+        // value across changing power would invent a different SWR.
+        val rho = swr?.let { (it - 1.0) / (it + 1.0) }
+        com.isaklab.isdrproto.RadioTelemetry(
+            forwardPower = forward, hasFwdPower = true,
+            reversePower = if (rho != null) forward * rho * rho else 0.0,
+            hasRevPower = rho != null,
+        )
     }
 
     override fun setFrequency(hz: Long) {
@@ -1352,12 +1569,16 @@ class CivClient(
         if (span !in caps.spansHz) {
             throw IllegalArgumentException("CI-V scope span $span Hz is unsupported by ${modelName()}")
         }
+        val mode = transact(P.readScopeMode(rigAddr(), 0)!!, P.CMD_SCOPE)?.let { P.parseScopeMode(it, 0) }
+        if (mode != 0 && mode != 2) throw IllegalStateException("scope span requires CENTER or SCROLL-C mode")
         val frame = P.scopeSetSpan(rigAddr(), 0, span)
             ?: throw IllegalArgumentException("CI-V scope span $span Hz is not encodable")
         if (transact(frame, P.CMD_SCOPE) == null) {
             throw IllegalStateException("CI-V scope span $span Hz was not confirmed")
         }
-        spanHz.set(span)
+        val actual = transact(P.readScopeSpan(rigAddr(), 0)!!, P.CMD_SCOPE)?.let { P.parseScopeSpan(it, 0) }
+        if (actual != span) throw IllegalStateException("CI-V scope span read-back mismatch: requested $span, read $actual")
+        spanHz.set(actual)
     }
 
     override fun sampleRateHz(): Int = spanHz.get().toInt()
